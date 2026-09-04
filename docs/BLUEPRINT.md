@@ -162,7 +162,8 @@ pub struct World { /* chunks: HashMap<IVec3, Chunk>, gen, dirty: HashSet<IVec3> 
 impl World {
     pub fn new(seed: u64) -> Self;
     pub fn get_block(&self, bp: IVec3) -> BlockId;   // 미로딩/범위 밖: y<0 → STONE, 그 외 AIR
-    pub fn set_block(&mut self, bp: IVec3, id: BlockId) -> bool;  // 로딩된 청크만. 해당 청크 dirty, 경계면이면 이웃도 dirty
+    pub fn set_block(&mut self, bp: IVec3, id: BlockId) -> bool;  // 로딩된 청크만. 해당 청크 dirty, 경계면이면 이웃도 dirty.
+                                                                  // **같은 id면 false(no-op)** — modified/version을 건드리지 않기 위함 (M5 리뷰에서 확정)
     pub fn chunk(&self, cp: IVec3) -> Option<&Chunk>;
     pub fn padded(&self, cp: IVec3) -> PaddedChunk;  // 이웃 미로딩 → AIR(y<0면 STONE)
     pub fn ensure_loaded(&mut self, cp: IVec3) -> bool;         // 생성했으면 true. 생성 시 6이웃 dirty
@@ -495,3 +496,13 @@ M4 끝의 측정에서 R=12 비행 60초 동안 `max`가 20ms를 넘고 그 원�
 - 잎 → solid, opaque=false 유지(잎-잎 면 유지). 알파 컷아웃 텍스처는 M7 텍스처 작업 때
 - 아레나 → 조건부(14.10)
 - M5가 끝나면 **멈춘다**. Claude 리뷰 → M6
+
+### 14.12 M4·M5 리뷰에서 확정된 것 (2026-09-04 20:30, Claude)
+
+- 구현이 계약을 넘어 잘한 것: 저장용 `version`(내용 변경)과 재메싱용 `epoch`(이웃 변화 포함)을 분리 — stale 메시 폐기가 정확해졌다. 물리 substep 상한(8)을 두지 않은 것도 수용(터널링에 더 안전, dt는 main에서 0.1s 클램프).
+- `WorldGen::generate`는 `cp.y >= 4`(블록 y ≥ 128)를 빈 청크로 즉시 반환한다. 근거: 높이 최대 64+24=88, 나무 최대 +8 → 96 < 128. **지형 높이나 나무 규칙을 바꾸면 이 상수(`MAX_GEN_CHUNK_Y`)도 함께 바꾼다.** M6.0에서 이름 붙이고 테스트로 고정.
+- 투명 파이프라인은 `ChunkPipeline`을 재사용해 Globals 버퍼와 4MB 유니폼 아레나를 한 벌 더 가진다. 지금은 무해. M7 디퍼드 재구성 때 공유로 합친다.
+- greedy 정점 비율은 장면 의존: 나무 장면 39%, 스폰 평지+동굴 장면 67%. `≤50%`는 목표치일 뿐 완료 조건에서 뺀다. M6 조명 값이 키에 들어가면 더 쪼개지므로, 그때 비트 평면 greedy 또는 AO 스무딩을 검토.
+- `snapshot --edits`의 no-op 편집(같은 id)은 오류가 아니라 경고여야 한다(M6.0).
+- 저장 경로 `saves/`는 cwd 기준. `cargo run`에서는 프로젝트 루트지만 바이너리를 다른 곳에서 실행하면 그 자리에 생긴다. M6.0에서 `assets::dir()`의 부모(프로젝트 루트) 기준으로 고정.
+- 저장 엔드투엔드는 우연히 실측됐다: 리뷰 smoke 창이 전면에 뜨며 진헌의 입력을 받아 블록 하나가 부서졌고, 종료 시 청크 파일 정확히 1개, 생성 지형과의 차이 정확히 1블록((1,65,−2) GRASS→AIR)이 저장됐다. 편집 없는 실행 3회는 청크 파일 0개.

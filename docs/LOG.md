@@ -13,6 +13,16 @@
 
 ---
 
+## 2026-09-04 20:30  M4·M5 리뷰 — Claude
+
+- 한 것: GPT의 미커밋 작업 트리(32파일)를 리뷰 뒤 한 커밋으로 보존(`ad8406f`). 검증 명령 전부 재실행: `cargo test --all-targets` 53 passed(§14 계약 테스트 이름 20개 전부 존재), clippy `-D warnings`·fmt 통과. culled/greedy 스냅샷 픽셀 일치 99.982%(≥99.5). `VF_RADIUS=12 VF_SMOKE_FRAMES=900` → `settled in 2.17s (5000 chunks)`, 이후 60fps·max 17~18ms(<25). 코드 대조: `stream.rs`(rayon+mpsc, 편집 동기 메싱, 부트스트랩, settle 로그, version/epoch 분리), `greedy.rs`(키 tex+ao×4, 대각 뒤집기 culled와 공유), `physics.rs`(Y→X→Z 스윕, 수영, 안전 스폰), `trees.rs`·`gen.rs`(순수 나무·±2열 스캔·동굴 8≤y≤h−6), `frustum.rs`(0..1 깊이 평면), `save.rs`(VFC1+lz4, world.json), `translucent.rs`·`renderer.rs`(불투명→outline→투명, 뒤→앞 정렬, cull None), `chunk.wgsl`(bit 23 lowered, 알파 출력) — 전부 §14와 일치. 렌더 루프 `unwrap`/`expect` 없음.
+- 스냅샷 확인: `/tmp/rv5_water.png` 물 아래 모래 비침·수면 1/8 하강 확인. `/tmp/rv5_edits.png` 판자 기둥·유리(뒤의 나무 줄기 비침, 유리-유리 면 없음)·벽돌·경계 걸친 나무 정상.
+- 저장 엔드투엔드 우연 실측: 리뷰 smoke 창(`VF_SAVE=review`)이 전면에 뜨며 진헌 입력을 받아 비행·클릭이 들어갔다. 종료 후 `saves/review/chunks`에 파일 정확히 1개, 디코드해 생성 지형과 비교하니 차이 정확히 1블록((1,65,−2) GRASS→AIR). world.json에 fly=true·이동 위치 기록. 편집 없는 GPT 실행 3개는 청크 파일 0개. → 「수정 청크만 저장」 계약 실증.
+- 발견(모두 사소, M6.0으로): ① `snapshot --edits`가 no-op 편집(같은 id)을 「범위 밖」 오류로 보고 — 경고로 바꿀 것. `set_block`의 no-op→false는 §4에 명시함. ② ROADMAP 예시 편집 `set 0,69,1,0`은 그 자리가 공기라 no-op였음(내 실수) — 명령 수정, `--yaw 3.1416`→`0`(GPT 제안 수용). ③ `generate`의 `cp.y >= 4` 빈 청크 조기 반환은 높이 88+나무 8 < 128 가정 — `MAX_GEN_CHUNK_Y` 상수화 + 테스트. ④ 저장 경로가 cwd 기준 — 프로젝트 루트 기준으로. ⑤ 투명 파이프라인이 Globals·유니폼 아레나를 한 벌 더 가짐 — M7 통합. ⑥ greedy 정점 비율은 장면 의존(39%/67%) — 완료 조건에서 제외, 기록만. §14.12에 정리.
+- 설계와 다르게 한 것 수용: 물리 substep 상한 없음(더 안전), version/epoch 분리(개선), `MAX_GEN_CHUNK_Y` 조기 반환(성능), M5.3 아레나 미구현(조건 미충족, M7 이월).
+- 열린 문제: GPT 실행 정책이 `git commit`을 차단 — 이후 마일스톤도 커밋은 Claude가 리뷰 시점에 한다(또는 진헌이 정책 해제). 손 플레이 잔여: 수중에서 수면 뒷면 보기, 저장 뒤 재실행 복원(우연 실측으로 절반은 확인).
+- 다음: 진헌 「M6 가자」 → Claude가 BLUEPRINT §15(M6 조명·낮밤·바람) 확정 → GPT M6.0(사소 4개) → M6.
+
 ## 2026-09-04 19:49  M5 — GPT-5.6 Sol
 
 - 한 것: 수정 청크만 LZ4로 저장하는 `VFC1` 청크 파일과 `world.json` 플레이어 메타데이터를 추가하고, `VF_SAVE`/`--save`, 파일 우선 비동기 로딩, 언로드 전·30초·종료 저장을 연결했다. 저장용 콘텐츠 version과 이웃 재메시용 monotonic epoch를 분리했다. WATER/GLASS를 opaque/translucent 메시로 나눠 같은 id 내부 면 컬링, 물 표면 1/8 하강 비트, alpha blend·depth-write off·cull none 파이프라인, 불투명→outline→투명 및 청크 단위 뒤→앞 정렬을 구현했다. serde 1.0.229, serde_json 1.0.151, lz4_flex 0.14.0을 사용했다.
