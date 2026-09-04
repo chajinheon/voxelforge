@@ -13,6 +13,15 @@
 
 ---
 
+## 2026-09-04 13:40  M3 리뷰 — Claude
+
+- 한 것: 리뷰 체크리스트 5항목 수행. 검증 명령 전부 재실행(테스트 25 passed, clippy `-D warnings` 통과, fmt 통과, 스냅샷 `/tmp/rv_m3_default.png` 190청크). 계약 대조: `vertex.rs` 비트 레이아웃, `coords.rs` 면 코너 표 6개, `chunk.wgsl` 디코드·UV·음영, `gen.rs` 층 규칙, `raycast.rs` DDA·법선, `world.rs` dirty 전파, `chunk_pipeline.rs` dynamic offset·에러 스코프, `window_gpu.rs` `CurrentSurfaceTexture` 7변형 — 전부 일치. 렌더 루프에 `unwrap`/`expect` 없음(테스트 제외).
+- **결함 1 (수정함)**: 메셔 AO가 가리는 블록을 `bp + s`(블록 자신의 층)에서 읽어 평지 전체가 ao=0. 스냅샷 픽셀 실측 (61,103,34) = 기준색 (95,159,53)의 선형 밝기 0.35배. 원인의 절반은 BLUEPRINT §4가 「이웃」의 층을 명시하지 않은 것. 수정: `neighbor(=bp+normal) + s`. 테스트 `mesher_ao_reads_layer_in_front_of_face` 추가(동일 평면 이웃은 3, 대각 위 블록은 해당 코너만 2, 평지 3). 수정 후 실측 (91,149,54). 커밋 `d4d7e27`. §4·§8 갱신.
+- **결함 2 (GPT에 요청, M3.1)**: 초기 로딩. GPT 분석이 맞다 — 개수 예산 4/프레임은 하한 5.63초. 결정: 개수 예산 폐기, **시간 예산 ≤10ms/프레임** + 빈 청크 메싱 생략 + 스폰 반경 1 동기 부트스트랩 + `stream: settled` 로그. `<3초` 계약은 이 로그 기준으로 유지, 단일 스레드로 미달이면 M4에서 확정. §5·§7·§12 갱신.
+- 소소한 것(M3.1): `snapshot --edits` 미구현(선택이었지만 손 플레이 대체 수단이라 필수로 올림), `chunk.wgsl` 더미 연산, `gen.rs` `let _ = self.seed`와 `Chunk` 내부 직접 쓰기, `origin / CHUNK_SIZE`. `DEFAULT_SLOTS 4096`은 M4 R=12(5000청크)에서 부족 — §12에 적음. glam 0.33.1이 `perspective_rh`/`look_to_rh`를 deprecated — `#[allow(deprecated)]` 유지 결정, D4에 기록.
+- 잘된 것: 렌더러가 창을 모른다(D16 의도대로 스냅샷과 공유). 핫리로드 에러 스코프 처리. `padded()` 27회 청크 조회 최적화. 500줄 규칙 지킴(`window_gpu.rs` 분리).
+- 다음: GPT → M3.1(ROADMAP 참조) → 진헌 손 플레이 → M3 종료 → M4.
+
 ## 2026-09-04 13:04  M3 — GPT-5.6 Sol
 
 - 한 것: Amanatides–Woo DDA 레이캐스트, 12모서리 조준 outline, LMB 부수기/RMB 놓기, 물 통과·물 위치 대체, 플레이어 AABB 겹침 거절, 1~9·휠 핫바, F3 통계, 편집 청크·경계 이웃 우선 재메싱을 구현했다. `main.rs` 500줄 제한을 지키기 위해 창/서피스 보조 코드를 `window_gpu.rs`로 분리했다. 측정된 로딩 히치를 줄이려고 월드젠 높이를 열당 1회 계산하고 패딩의 청크 조회를 최대 27회로 줄였다.

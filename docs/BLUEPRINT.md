@@ -17,7 +17,7 @@
 | D1 | Rust + wgpu(Metal 백엔드) + winit. 엔진·ECS 없음 | 에디터 없이 전부 텍스트 → 두 에이전트가 `cargo build/test`와 PNG 스냅샷으로 검증 가능. 컴파일 시간·제어권 확보 |
 | D2 | 청크 **32³** 정육면체, 수직 8청크(블록 y 0..256) | 드로우 수 적음. 로컬 좌표 6비트 패킹. 패딩 메셔로 재메싱 비용 감당 가능 |
 | D3 | 블록 ID `u16`, 청크는 평탄 배열 `Box<[u16; 32768]>` | 단순. 팔레트 압축은 메모리가 문제될 때(M5+) |
-| D4 | 좌표계 오른손, **Y-up**. `glam::Mat4::perspective_rh`(깊이 0..1), `look_to_rh` | wgpu/Metal 깊이 범위와 일치 |
+| D4 | 좌표계 오른손, **Y-up**. `glam::Mat4::perspective_rh`(깊이 0..1), `look_to_rh` | wgpu/Metal 깊이 범위와 일치. glam 0.33.1부터 이 둘은 deprecated(대체 `glam::camera::rh::proj::directx::perspective`, `glam::camera::rh::look_to`). 동작은 같으므로 M4까지 `#[allow(deprecated)]` 허용, M4 물리 작업 때 이관 |
 | D5 | 정점 = `2 × u32` 패킹. UV는 정점에 없고 셰이더에서 로컬 좌표로 계산 | 정점 8바이트. greedy 병합 시 Repeat 샘플러로 자연 타일링 |
 | D6 | 텍스처는 **`texture_2d_array`** 16×16, 아틀라스 금지 | 경계 번짐 없음, greedy 호환 |
 | D7 | 메싱은 **패딩 34³ 스냅샷** 입력(`PaddedChunk`)으로 한다. 메셔는 World를 직접 보지 않는다 | 경계 면 컬링이 단순해지고 M4에서 스레드로 옮길 때 락 없이 그대로 감 |
@@ -184,7 +184,10 @@ pub fn unpack(v: ChunkVertex) -> (u32, u32, u32, u32, u32, u32, u32, u32);  // �
 // mesh/mesher.rs
 pub struct ChunkMesh { pub vertices: Vec<ChunkVertex>, pub indices: Vec<u32> }
 pub fn mesh_chunk(p: &PaddedChunk) -> ChunkMesh;    // culled: 이웃이 opaque가 아니면 면 생성. 자기 자신이 AIR면 없음
-// AO: 정점마다 side1, side2, corner(이웃 opaque 여부) → if side1&&side2 {0} else {3 - (side1+side2+corner)}
+// AO(0fps 방식): 가리는 블록은 **면 앞 층**에 있다. front = bp + FACE_NORMALS[face].
+//   side1 = opaque(front + s1), side2 = opaque(front + s2), corner = opaque(front + s1 + s2)   (s1, s2 = 코너 쪽 ±접선축)
+//   ao = if side1 && side2 { 0 } else { 3 - (side1 + side2 + corner) }
+//   bp + s (블록 자신의 층)는 같은 평면이라 가리지 않는다. 이걸 섞으면 평지 전체가 ao=0으로 어두워진다(M3 리뷰에서 실측 확인).
 
 // player/camera.rs
 pub struct Camera { pub pos: Vec3, pub yaw: f32, pub pitch: f32, pub fov_y: f32, pub near: f32, pub far: f32 }
@@ -247,8 +250,10 @@ let world_pos = vec3<f32>(chunk.origin.xyz) + local;
 
 1. `dt` 계산(clamp 0.1s)
 2. 입력 → 카메라(비행): 속도 12 blk/s, 스프린트(LCtrl) ×3, Space 상승, LShift 하강. WASD는 yaw 기준 수평
-3. 스트리밍: 플레이어 청크 기준 수평 반경 `R=6`, 수직 전체(0..8). 가까운 순으로 `ensure_loaded` **프레임당 ≤ 4**, `unload_outside(R+2)`
-4. `take_dirty()` → 가까운 순 정렬 → **프레임당 ≤ 8** 청크 `padded → mesh_chunk → 업로드`. 결과가 빈 메시면 GPU 리소스 제거
+3. 스트리밍: 플레이어 청크 기준 수평 반경 `R=6`, 수직 전체(0..8). 가까운 순으로 `ensure_loaded`, `unload_outside(R+2)`
+4. `take_dirty()` → 가까운 순(편집 청크 최우선) 정렬 → `padded → mesh_chunk → 업로드`. 결과가 빈 메시면 GPU 리소스 제거
+
+   **예산(2026-09-04 리뷰에서 개수→시간으로 변경)**: 3·4를 합쳐 **프레임당 ≤ 10ms**(`Instant`로 재고, 청크 하나 끝날 때마다 확인). 개수 상한 없음. 큐가 비면 0ms. `chunk.is_empty()`인 청크는 메싱하지 않는다(절반이 공기). 첫 프레임 전에 스폰 반경 1(3×3×8)은 동기 로딩·메싱한다. 원하는 집합이 전부 로딩·메싱된 순간 `stream: settled in {:.2}s ({} chunks)`를 1회 로그로 남긴다 — §7의 초기 로딩 기준은 이 로그다.
 5. 레이캐스트(max 6.0) → outline 위치
 6. `Renderer::render(...)`
 7. 1초마다 창 제목 갱신: `voxelforge | 60 fps | max 17.2ms | pos 12.3 71.0 -4.5 | chunks 812 drawn 214 | meshq 0`
@@ -286,13 +291,13 @@ cargo run --release --bin snapshot -- [--seed 1] [--pos 0,80,0] [--yaw 0.6] [--p
 
 ## 7. 성능 예산 (M3 기준, Apple M5, 2560×1440)
 
-- 60 fps 유지, 프레임 최대 < 33ms(히치 없음). 초기 로딩(R=6) < 3초(release).
+- 60 fps 유지, 프레임 최대 < 33ms(히치 없음). 초기 로딩(R=6, release) < 3초 = `stream: settled` 로그 기준. 개수 예산(4/프레임)으로는 하한이 5.6초라 §5의 시간 예산으로 바꿨다. 단일 스레드 10ms 예산으로도 미달이면 M4 워커 스레드에서 확정한다.
 - 청크 32³ culled 메싱 release < 1ms/청크. 메모리: 로딩 청크 ≤ ~1400개 × 64KB ≈ 90MB + GPU 메시.
 - 플레이는 `--release`. dev 프로필도 의존성은 `opt-level 3`(Cargo.toml).
 
 ## 8. 테스트 계약 (M1/M3에서 반드시 존재하는 이름)
 
-`coords_floor_div_negative`, `chunk_index_roundtrip`, `chunk_set_get_and_non_air`, `vertex_pack_roundtrip`, `mesher_lone_block_has_6_faces`(24 vert/36 idx), `mesher_enclosed_block_has_0_faces`, `mesher_two_adjacent_blocks_10_faces`, `mesher_border_face_culled_by_padding`, `gen_is_deterministic_for_seed`, `gen_layers_match_height`, `raycast_hits_block_in_front`, `raycast_face_normal_is_toward_origin`, `raycast_misses_when_only_air`, `raycast_passes_through_water`, `set_block_marks_neighbor_dirty_on_border`, `place_rejected_inside_player_aabb`.
+`coords_floor_div_negative`, `chunk_index_roundtrip`, `chunk_set_get_and_non_air`, `vertex_pack_roundtrip`, `mesher_lone_block_has_6_faces`(24 vert/36 idx, AO 전부 3), `mesher_ao_reads_layer_in_front_of_face`(리뷰에서 추가), `mesher_enclosed_block_has_0_faces`, `mesher_two_adjacent_blocks_10_faces`, `mesher_border_face_culled_by_padding`, `gen_is_deterministic_for_seed`, `gen_layers_match_height`, `raycast_hits_block_in_front`, `raycast_face_normal_is_toward_origin`, `raycast_misses_when_only_air`, `raycast_passes_through_water`, `set_block_marks_neighbor_dirty_on_border`, `place_rejected_inside_player_aabb`.
 
 ## 9. 에셋 경로 (D18)
 
@@ -320,6 +325,9 @@ cargo run --release --bin snapshot -- [--seed 1] [--pos 0,80,0] [--yaw 0.6] [--p
 | DepthStencilState | `depth_write_enabled: Option<bool>`, `depth_compare: Option<CompareFunction>` |
 | SurfaceConfiguration | `color_space` 필드 추가. `get_default_config`가 채워 줌 |
 | 서피스 수명 | `Surface<'static>`는 `instance.create_surface(Arc<Window>)`로 |
+| 파이프라인 레이아웃 | `PipelineLayoutDescriptor{ label, bind_group_layouts: &[Option<&BindGroupLayout>], immediate_size: 0 }` (push_constant_ranges 대신 `immediate_size`) |
+| 에러 스코프 | `let scope = device.push_error_scope(ErrorFilter::Validation); … ; pollster::block_on(scope.pop())` — 스코프 객체를 반환하고 그 객체의 `pop()`을 기다린다 |
+| 텍스처 복사 타입 | `TexelCopyTextureInfo`, `TexelCopyBufferLayout` (구 `ImageCopyTexture`/`ImageDataLayout`). 샘플러 `mipmap_filter: MipmapFilterMode` |
 | 소스 위치 | `~/.cargo/registry/src/index.crates.io-*/wgpu-30.0.1/src/api/`, 타입은 `wgpu-types-30.0.1/src/` |
 
 winit 0.30: `ApplicationHandler` 트레이트(`resumed`, `window_event`, `device_event`, `about_to_wait`), `event_loop.create_window(Window::default_attributes())`, `EventLoop::new()?.run_app(&mut app)?`. 실제 동작 예는 M0 `src/main.rs`(git 첫 커밋)에 있다.
@@ -339,6 +347,8 @@ winit 0.30: `ApplicationHandler` 트레이트(`resumed`, `window_event`, `device
 - 저장 포맷(M5) → 수정된 청크만 `saves/<name>/c_<x>_<y>_<z>.bin`(lz4) + `world.json{seed}`. 리전 파일은 필요해질 때
 - 엔진 크레이트(bevy) → 사용 안 함
 - Retina 렌더 스케일 → M7까지 물리 해상도 그대로
+- 스트리밍 예산 → **시간 예산(≤10ms/프레임)**, 개수 예산 아님 (§5). 빈 청크는 메싱 생략
+- 청크 유니폼 아레나 슬롯(현재 4096 고정) → M4에서 R=12면 25×25×8=5000 청크라 부족. 반경에서 계산하거나 부족 시 재할당
 
 ## 13. 이후 티어 요약 (상세는 ROADMAP)
 

@@ -47,7 +47,7 @@ cargo run --release                                # 진헌/Claude 플레이 확
 cargo run --release --bin snapshot -- --pos 100,90,-60 --yaw 2.4 --pitch -0.35 --out /tmp/vf_m2.png
 ```
 
-## M3 — 건축 (≈1~2h) ← **오늘의 목표**
+## M3 — 건축 (≈1~2h) ← **오늘의 목표** (기능 완료 2026-09-04 13:04, 리뷰 통과 조건부 — M3.1 참조)
 
 **만드는 것**: `world/raycast.rs`(DDA), `render/outline.rs` + `outline.wgsl`, LMB 부수기 / RMB 놓기, `HOTBAR` 1~9 + 휠, 플레이어 AABB 겹침 거절, 편집 시 청크 + 경계 이웃 재메싱.
 
@@ -66,6 +66,23 @@ cargo run --release                                # 실제로 짓는다
 ```
 
 **M3가 끝나면 멈추고 LOG에 기록 → Claude 리뷰.** 리뷰 전엔 M4로 가지 않는다.
+
+## M3.1 — 리뷰 수정 (≈1h, GPT) ← **현재 위치**
+
+2026-09-04 Claude 리뷰 결과. AO 결함은 Claude가 직접 고쳐 커밋했다(`d4d7e27`). 아래는 GPT 몫.
+
+**만드는 것**
+1. 스트리밍 예산을 개수(4/8)에서 **시간 예산 ≤10ms/프레임**으로 교체(BLUEPRINT §5). 첫 프레임 전 스폰 반경 1 동기 로딩·메싱. `is_empty()` 청크 메싱 생략. `stream: settled in X.XXs (N chunks)` 로그 1회.
+2. `snapshot --edits "set x,y,z,id; set …"` 옵션(모든 청크 로딩 후 적용, dirty 재메싱 뒤 렌더). 손 플레이를 자동화할 수 없으니 이게 건축 회귀 테스트다.
+3. `chunk.wgsl`의 `packed_light * 0.0` / `sky * 0u` 우회 제거 — naga는 미사용 변수를 경고하지 않는다. `light`/`sky`는 디코드만 남기거나 M6까지 주석 처리.
+4. `gen.rs`: `let _ = self.seed;` 제거(필드를 쓰거나 지운다), `chunk.blocks[..] = id; chunk.non_air += 1` 직접 쓰기 대신 `Chunk::set` 또는 전용 생성자 사용.
+5. `main.rs` `remove_unloaded_gpu_chunks`: `origin / CHUNK_SIZE` → `chunk_of(origin)`(지금은 32의 배수라 우연히 맞음).
+
+**완료 조건**
+- `VF_SMOKE_FRAMES=600 cargo run --release` 로그에 `stream: settled in` **< 3.00s**, 로딩 중 프레임 최대 < 33ms(제목·F3 통계).
+- `cargo run --release --bin snapshot -- --seed 1 --radius 3 --pos 0,74,8 --yaw 3.1416 --pitch -0.35 --edits "set 0,70,0,8; set 0,71,0,8; set 0,72,0,8; set 1,70,0,9; set -1,70,0,10; set 0,69,1,0" --out /tmp/vf_m31_edits.png` → 판자 기둥 3개·유리·벽돌·구멍이 PNG에 보인다.
+- `cargo test` 26 passed, clippy `-D warnings` 0, `cargo fmt --check` 통과.
+- LOG 기록 후 커밋 `M3.1: review fixes`. 그 다음 **진헌의 손 플레이**(5×5 벽 + 유리창 + 나무 지붕) → 통과하면 M4.
 
 ---
 
