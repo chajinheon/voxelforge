@@ -51,9 +51,12 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
                         let (tangent_1, tangent_2) = FACE_TANGENTS[face];
                         let s1 = corner_side(bp, position, tangent_1);
                         let s2 = corner_side(bp, position, tangent_2);
-                        let side1 = opaque(padded, bp + s1);
-                        let side2 = opaque(padded, bp + s2);
-                        let diagonal = opaque(padded, bp + s1 + s2);
+                        // Occluders live in the layer *in front of* the face
+                        // (BLUEPRINT §4). Blocks in the block's own layer share
+                        // the face plane and never occlude it.
+                        let side1 = opaque(padded, neighbor + s1);
+                        let side2 = opaque(padded, neighbor + s2);
+                        let diagonal = opaque(padded, neighbor + s1 + s2);
                         let ao = if side1 && side2 {
                             0
                         } else {
@@ -109,18 +112,48 @@ mod tests {
         padded
     }
 
+    fn ao_of(mesh: &ChunkMesh, range: std::ops::Range<usize>) -> Vec<u32> {
+        mesh.vertices[range]
+            .iter()
+            .map(|vertex| crate::mesh::vertex::unpack(*vertex).4)
+            .collect()
+    }
+
     #[test]
     fn mesher_lone_block_has_6_faces() {
         let mesh = mesh_chunk(&chunk_with(&[(0, 0, 0)]));
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(mesh.indices.len(), 36);
+        // Nothing around the block: every vertex is fully open.
+        assert!(ao_of(&mesh, 0..24).iter().all(|&ao| ao == 3));
+    }
 
-        let shadowed = mesh_chunk(&chunk_with(&[(0, 0, 0), (0, -1, 0)]));
-        let face_ao: Vec<u32> = shadowed.vertices[..4]
-            .iter()
-            .map(|vertex| crate::mesh::vertex::unpack(*vertex).4)
-            .collect();
-        assert_eq!(face_ao, [2, 3, 3, 2]);
+    #[test]
+    fn mesher_ao_reads_layer_in_front_of_face() {
+        // A block directly below shares the +X face plane: coplanar neighbours
+        // must not darken that face (face 0 is emitted first for block A).
+        let stacked = mesh_chunk(&chunk_with(&[(0, 0, 0), (0, -1, 0)]));
+        assert_eq!(ao_of(&stacked, 0..4), [3, 3, 3, 3]);
+
+        // A block diagonally up (+X,+Y) protrudes in front of A's top face and
+        // beside A's +X face; only the corners touching it are occluded.
+        let diagonal = mesh_chunk(&chunk_with(&[(0, 0, 0), (1, 1, 0)]));
+        assert_eq!(ao_of(&diagonal, 0..4), [3, 2, 2, 3]); // +X face: corners at y+1
+        assert_eq!(ao_of(&diagonal, 8..12), [3, 3, 2, 2]); // +Y face: corners at x+1
+
+        // Flat ground: a 3x3 slab, centre block's top face is fully open.
+        let mut slab = Vec::new();
+        for z in -1..=1 {
+            for x in -1..=1 {
+                slab.push((x, 0, z));
+            }
+        }
+        let flat = mesh_chunk(&chunk_with(&slab));
+        // Centre block (0,0,0) is the first meshed block at (x=0,z=0) only if
+        // negative coordinates are padding; they are, so it is emitted first.
+        // Its +X/-X/+Z/-Z faces are culled by neighbours; +Y is face index 0
+        // of the emitted list, -Y second.
+        assert_eq!(ao_of(&flat, 0..4), [3, 3, 3, 3]);
     }
 
     #[test]
