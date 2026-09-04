@@ -44,6 +44,7 @@ pub struct GpuChunkMeshes {
 /// Opaque chunk pipeline and its dynamic-offset uniform arena.
 pub struct ChunkPipeline {
     pub pipeline: wgpu::RenderPipeline,
+    light_pipeline: wgpu::RenderPipeline,
     shader_module: wgpu::ShaderModule,
     pub globals_buffer: wgpu::Buffer,
     pub globals_bind_group: wgpu::BindGroup,
@@ -209,13 +210,29 @@ impl ChunkPipeline {
             label: Some("chunk-shader"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        let pipeline = create_pipeline(device, &layout, &shader_module, color_format, translucent);
+        let pipeline = create_pipeline(
+            device,
+            &layout,
+            &shader_module,
+            color_format,
+            translucent,
+            "fs_main",
+        );
+        let light_pipeline = create_pipeline(
+            device,
+            &layout,
+            &shader_module,
+            color_format,
+            translucent,
+            "fs_light",
+        );
         if let Some(error) = pollster::block_on(scope.pop()) {
             anyhow::bail!("chunk shader validation failed: {error}");
         }
 
         Ok(Self {
             pipeline,
+            light_pipeline,
             shader_module,
             globals_buffer,
             globals_bind_group,
@@ -336,6 +353,15 @@ impl ChunkPipeline {
             &module,
             color_format,
             self.is_translucent(),
+            "fs_main",
+        );
+        let light_pipeline = create_pipeline(
+            device,
+            &pipeline_layout,
+            &module,
+            color_format,
+            self.is_translucent(),
+            "fs_light",
         );
         if let Some(error) = pollster::block_on(scope.pop()) {
             log::error!("shader reload validation failed: {error}");
@@ -343,6 +369,7 @@ impl ChunkPipeline {
         }
         self.shader_module = module;
         self.pipeline = pipeline;
+        self.light_pipeline = light_pipeline;
         log::info!("shader reloaded: {}", self.shader_path.display());
         true
     }
@@ -375,6 +402,27 @@ impl ChunkPipeline {
         drawn
     }
 
+    pub(crate) fn draw_visible_light<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        chunks: &[&'a GpuChunk],
+        frustum: &Frustum,
+    ) -> usize {
+        pass.set_pipeline(&self.light_pipeline);
+        pass.set_bind_group(0, &self.globals_bind_group, &[]);
+        pass.set_bind_group(1, &self.texture_bind_group, &[]);
+        let mut drawn = 0;
+        for chunk in chunks {
+            let min = chunk.origin.as_vec3();
+            let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
+            if frustum.intersects_aabb(min, max) {
+                self.draw_unchecked(pass, chunk);
+                drawn += 1;
+            }
+        }
+        drawn
+    }
+
     pub(crate) fn set_state<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
@@ -403,6 +451,7 @@ fn create_pipeline(
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
     translucent: bool,
+    fragment_entry: &'static str,
 ) -> wgpu::RenderPipeline {
     const ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Uint32x2];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -434,7 +483,7 @@ fn create_pipeline(
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment_entry),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: color_format,

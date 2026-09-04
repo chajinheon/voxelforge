@@ -106,3 +106,238 @@ ChatGPT(GPT Pro)에 그대로 붙여 넣는다. 저장소 URL은 실제 주소�
 ## 5. 품질 기준
 
 Sol이 §14만 보고 M4·M5를 구현해 첫 리뷰에서 결함 0(사소 4개)으로 통과했다. 당신의 §15~§19도 같은 결과가 나와야 한다. 문장마다 「Sol이 이 줄만 보고 코드를 쓸 수 있나」를 물어라. 「적절히」, 「자연스럽게」, 「필요에 따라」 같은 말 대신 숫자·식·이름을 쓴다.
+
+# Sol M6→M10 진행 프롬프트 (2026-09-04, M5 리뷰 통과 후)
+
+아래를 그대로 붙여 넣는다.
+
+---
+
+당신은 `voxelforge`의 구현 담당이다. 현재 `main`은 M0~M5 구현과 Claude 리뷰를 통과했다. 이번 프롬프트는 M6~M10의 장기 진행 지침이지만, 리뷰 멈춤선을 절대로 건너뛰지 않는다.
+
+먼저 순서대로 읽어라.
+
+1. `AGENTS.md`
+2. `docs/LOG.md` 맨 위 M4·M5 리뷰 및 구현 기록 4개
+3. `docs/BLUEPRINT.md` §1, §3~§5, §11~§12, §14.11~§14.12
+4. 현재 허가된 마일스톤의 상세 절:
+
+   * M6: §15
+   * M7: §16
+   * M8·M9: §17~§18
+   * M10: §19
+5. `docs/ROADMAP.md`의 해당 마일스톤
+
+읽기 전에 코드를 수정하지 마라.
+
+절대 규칙:
+
+1. D1~D18, §12, §14.11, §14.12를 바꾸지 않는다. 필요하다고 생각해도 원안을 구현한 뒤 LOG의 「ADR 제안」에만 적는다.
+2. 청크 32³, `u16` ID, 34³ `PaddedChunk`, 정점 2×u32, `a[23] lowered`, `b[16..20] block light`, `b[20..24] sky light`, `texture_2d_array`, dynamic-offset 청크 uniform을 유지한다.
+3. `Renderer`에 `Window`, `Surface`, winit 타입을 넣지 않는다. 창과 snapshot은 같은 Renderer를 쓴다.
+4. `main.rs`와 `stream.rs`는 이미 한계에 가깝다. 500줄을 넘기지 말고 BLUEPRINT의 새 모듈로 분리한다.
+5. 우리 코드의 `unsafe`는 금지한다. 렌더 루프에 `unwrap`·`expect`를 넣지 않는다. 초기화 실패는 `anyhow::Result`, 프레임 오류는 로그·skip·기능 폴백으로 처리한다.
+6. wgpu 30은 기억으로 쓰지 않는다. §11 표에 없는 API를 쓰기 전에 `~/.cargo/registry/src/index.crates.io-*/wgpu-30.0.1/src/api/`와 `wgpu-types-30.0.1/src/`를 직접 읽는다. 구버전 이름 `ImageCopyTexture`, `SurfaceTexture::present`, `push_constant_ranges`, `Instance::new(&desc)`를 쓰지 않는다.
+7. WGSL은 naga가 검증하는 문법만 쓴다. shader/pipeline 생성·핫리로드는 error scope로 감싸고 실패 시 이전 묶음을 유지한다.
+8. 새 크레이트는 `cargo add`로 실제 버전을 설치하고 그 명령·버전을 LOG에 기록한다.
+9. 코드와 주석은 영어, 문서는 한국어다.
+10. 모든 순수 로직은 BLUEPRINT에 적힌 이름 그대로 단위 테스트를 만든다.
+11. 시각 완료 조건은 사람 눈으로 판정하지 않는다. ROADMAP의 snapshot 명령과 Python 픽셀 판정을 실제 실행해 숫자를 LOG에 남긴다.
+12. 성능은 Apple M5, 2560×1440, release, ROADMAP의 render scale·preset으로 측정한다. GPU timing은 지원될 때 비동기 timestamp를 쓰며 렌더 루프에서 readback을 기다리지 않는다.
+13. Sol은 `git commit`을 실행하지 않는다. 각 단계가 끝날 때 LOG에 의도한 커밋 메시지를 기록한다. 실제 커밋은 리뷰 시 Claude가 한다.
+14. 단계 하나마다 `cargo test --all-targets`, 영향 범위 snapshot, LOG 기록을 한다. 마일스톤 끝에서는 clippy·fmt·diff까지 전부 실행한다.
+15. 설계에서 선택으로 남긴 것은 없다. 다른 방식을 임의로 택하지 않는다.
+
+진행 순서와 멈춤선:
+
+## 첫 세션 — M6만
+
+순서:
+
+```text
+M6.0 → M6.1 → M6.2 → M6.3 → M6.4
+```
+
+M6.0 첫 작업:
+
+1. `snapshot --edits` no-op을 warning으로 변경.
+2. `MAX_GEN_CHUNK_Y = 4`와 테스트.
+3. 저장 기본 root를 프로젝트 root로 변경.
+4. 투명 Globals 중복은 건드리지 않고 M7 대상으로 남김.
+
+그 뒤 §15의 열 조명 solver부터 구현한다.
+
+M6 완료 조건과 BLUEPRINT §15.6 픽셀 검증을 전부 통과시키고 LOG에 다음 수치를 기록한다.
+
+```text
+test count
+R=12 settled seconds
+light column median/p95 ms
+max boundary requeue
+M5 대비 정점 비율
+steady max frame ms
+각 snapshot 경로와 픽셀 비율
+```
+
+M6가 끝나면 반드시 멈추고 다음 한 줄로 보고한다.
+
+```text
+M6 완료, 리뷰 요청
+```
+
+Claude의 명시적 승인 전에는 M7 파일을 만들지 않는다.
+
+## 두 번째 세션 — 승인 뒤 M7만
+
+먼저 갱신된 LOG와 Claude 리뷰를 읽는다. 순서:
+
+```text
+M7.0 → M7.1 → M7.2 → M7.3 → M7.4 → M7.5
+```
+
+M7.0에서 먼저 opaque/translucent Globals와 청크 uniform arena를 통합한다. VB/IB arena는 ROADMAP의 수치 게이트를 실제 실행한 결과로만 결정한다.
+
+M7에서 지형을 surface에 직접 그리는 경로를 제거한다. surface에는 native LDR present만 한다. `Renderer`는 surface를 소유하지 않는다.
+
+TAA는 구현하지 않는다. F4 순서와 snapshot view 이름을 계약대로 고정한다.
+
+M7 완료 시 다음을 LOG에 기록한다.
+
+```text
+arena gate p99 frame/upload와 선택
+각 GPU pass median/p95
+normal/depth/AO/shadow 픽셀 값
+auto exposure 결과
+render scale 내부 크기
+전체 p95/max
+```
+
+완료 뒤 멈추고:
+
+```text
+M7 완료, 리뷰 요청
+```
+
+Claude 승인 전에는 M8로 가지 않는다.
+
+## 세 번째 세션 — 승인 뒤 M8·M9 연속
+
+먼저 갱신된 LOG와 M7 리뷰를 읽는다.
+
+순서:
+
+```text
+M8.1 → M8.2 → M8.3 → M8.4 → M8.5
+→ M9.1 → M9.2 → M9.3 → M9.4
+```
+
+M8 종료 시 LOG는 기록하지만 리뷰 요청으로 멈추지 않는다.
+
+M8 주의:
+
+* WATER는 GLASS와 분리한다.
+* lowered bit를 유지한다.
+* 물 surface greedy는 최대 2×2.
+* 볼류메트릭과 구름은 internal 1/4.
+* blue-noise는 외부 파일이 아니라 §17 알고리즘으로 생성한다.
+* LOD는 2×/4×/8× 재귀 최빈값과 32블록 overlap·skirt다.
+* LOD cache hard cap을 넘기지 않는다.
+
+M9 주의:
+
+* 하드웨어 RT, Metal acceleration structure, ray query, `wgpu-hal`을 사용하지 않는다.
+* WGSL compute DDA만 사용한다.
+* 128³×4 clipmap.
+* balanced 4 rays, 48블록, 96 crossing.
+* temporal history 0.90, à-trous 3단계.
+* 필수 기능 실패 시 GI 전체를 끄고 M6 baked light + SSAO로 폴백한다.
+
+M9 완료 시 LOG:
+
+```text
+water/volumetric/cloud/LOD pass p95
+LOD CPU/GPU memory
+clipmap memory와 upload bytes/frame
+GI trace/temporal/denoise p95
+GI room 밝기·색 비율
+temporal noise 감소율
+전체 p95/max
+fallback simulation 결과
+```
+
+완료 뒤 멈추고:
+
+```text
+M8·M9 완료, 리뷰 요청
+```
+
+Claude 승인 전에는 M10으로 가지 않는다.
+
+## 네 번째 세션 — 승인 뒤 M10
+
+먼저 갱신된 LOG와 M9 리뷰를 읽는다.
+
+순서:
+
+```text
+M10.1 → M10.2 → M10.3 → M10.4 → M10.5
+```
+
+M10 주의:
+
+* `cargo add font8x8`, `cargo add rodio`의 실제 버전을 LOG에 적는다.
+* F3는 콘솔 통계다. 디버그 텍스트 오버레이로 바꾸지 않는다.
+* ESC는 pause/resume이며 두 번째 ESC 종료를 제거한다.
+* 설정은 atomic JSON.
+* 사운드는 절차 PCM이고 장치 실패는 silent fallback.
+* 셰이더팩 교체는 전체 transactional swap.
+* `.app` launcher가 `VF_ASSETS` 등 경로를 설정해 D18을 유지한다.
+* MetalFX는 구현하지 않는다.
+* signing identity·notary profile이 없으면 ad-hoc bundle 검증까지만 수행한다. notarize 성공을 거짓으로 기록하지 않는다.
+
+M10 완료 시 LOG:
+
+```text
+test count
+HUD/pause pixel 판정
+settings roundtrip/atomic 결과
+audio WAV RMS/peak
+shaderpack failure fallback
+bundle path
+plutil/codesign 결과
+Balanced p95/max
+메모리 추정
+notarize 실행 여부와 실제 결과
+```
+
+완료 뒤 멈추고:
+
+```text
+M10 완료, 최종 리뷰 요청
+```
+
+Claude가 최종 검증·커밋하기 전에는 프로젝트 완료라고 선언하지 않는다.
+
+시작: M6.0의 `snapshot_noop_edit_is_warning` 테스트부터 fail-first로 작성하라.
+
+---
+
+## ADR 제안
+
+없음.
+
+M10 `.app`의 asset 경로는 D18을 바꾸지 않고 launcher가 `VF_ASSETS`를 설정한다. MetalFX는 현행 `unsafe` 금지와 Renderer 계약을 유지하기 위해 범위에서 제외했다.
+
+## 진헌만 정할 수 있는 질문
+
+없음.
+
+서명·notarize에 필요한 Apple Developer identity와 keychain profile은 설계 결정이 아니라 배포 시 환경 입력이다. 기본은 ad-hoc 서명이며, 값이 제공됐을 때만 정식 서명·notarize를 실행한다.
+
+## Claude 검토 포인트
+
+1. M6 광원 제거가 열 경계 고정점에서 15회 이내 실제로 0에 수렴하며 조명 변경이 저장 `modified/version`을 오염시키지 않는지.
+2. M7의 공유 `SceneBindings`, G버퍼 포맷, wgpu 30 bind-group·timestamp API가 실소스와 맞고 surface direct geometry가 완전히 제거됐는지.
+3. M8 WATER의 HDR read/write feedback 회피, 볼류메트릭 temporal reject, LOD overlap·skirt·메모리 cap이 계약대로인지.
+4. M9가 하드웨어 RT 없이 compute DDA만 사용하고 clipmap toroidal wrap·RGB emission·전체 GI 폴백이 정확한지.
+5. M10 launcher가 D18과 배포 쓰기 경로를 동시에 지키며 셰이더팩·설정·스크린샷·오디오 실패가 게임 종료로 이어지지 않는지.

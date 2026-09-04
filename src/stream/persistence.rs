@@ -103,7 +103,6 @@ mod tests {
     use super::*;
     use crate::world::block::BRICK;
     use glam::UVec3;
-    use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -116,8 +115,14 @@ mod tests {
                 .expect("clock before epoch")
                 .as_nanos()
         );
-        let save = SaveDir::open(&name).expect("open isolated save");
         let cp = IVec3::new(0, 2, 0);
+        let save = SaveDir::open(&name).expect("open isolated save");
+        let save_root = save
+            .chunk_path(cp)
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("save chunk path has save root")
+            .to_path_buf();
         let marker = UVec3::new(3, 4, 5);
         let mut saved = Chunk::new_air();
         saved.set(marker, BRICK);
@@ -137,6 +142,6 @@ mod tests {
         }
         assert_eq!(world.chunk(cp).expect("loaded chunk").get(marker), BRICK);
 
-        std::fs::remove_dir_all(PathBuf::from("saves").join(name)).expect("remove isolated save");
+        std::fs::remove_dir_all(save_root).expect("remove isolated save");
     }
 }

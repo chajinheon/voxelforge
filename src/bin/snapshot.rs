@@ -5,11 +5,19 @@ use std::path::PathBuf;
 use anyhow::Context;
 use glam::{IVec3, Vec3};
 use voxelforge::mesh::{ChunkMeshes, mesh_chunk_all, mesh_chunk_greedy_all};
-use voxelforge::render::{Globals, Gpu, GpuChunkMeshes, OffscreenTarget, Renderer};
-use voxelforge::world::block::{AIR, BlockId, COBBLE};
-use voxelforge::world::coords::{WORLD_CHUNKS_Y, chunk_of};
+use voxelforge::render::{
+    DAY_LENGTH_SECONDS, Globals, Gpu, GpuChunkMeshes, OffscreenTarget, RenderView, Renderer,
+    day_state,
+};
+use voxelforge::stream::Streamer;
+use voxelforge::world::block::{AIR, BlockId, TORCH};
+use voxelforge::world::coords::{CHUNK_SIZE, WORLD_CHUNKS_Y, chunk_of};
 use voxelforge::world::r#gen::WorldGen;
 use voxelforge::world::world::World;
+
+#[path = "snapshot/fixtures.rs"]
+mod fixtures;
+use fixtures::{Fixture, View};
 
 const DEFAULT_SEED: u64 = 1;
 const DEFAULT_YAW: f32 = 0.6;
@@ -45,6 +53,10 @@ struct Options {
     out: PathBuf,
     edits: Vec<Edit>,
     mesher: MesherMode,
+    fixture: Fixture,
+    view: View,
+    day_phase: Option<f32>,
+    world_time: Option<f32>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -58,9 +70,25 @@ fn main() -> anyhow::Result<()> {
     let mut renderer = Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8UnormSrgb)?;
 
     let generator = WorldGen::new(options.seed);
-    let position = options
-        .pos
-        .unwrap_or_else(|| Vec3::new(0.0, generator.height_at(0, 0) as f32 + 3.0, 0.0));
+    let (fixture_position, fixture_yaw, fixture_pitch) = fixtures::camera(options.fixture);
+    let position = options.pos.unwrap_or_else(|| {
+        if matches!(options.fixture, Fixture::Terrain) {
+            Vec3::new(0.0, generator.height_at(0, 0) as f32 + 3.0, 0.0)
+        } else {
+            fixture_position
+        }
+    });
+    let custom_fixture = !matches!(options.fixture, Fixture::Terrain);
+    let yaw = if custom_fixture && options.pos.is_none() {
+        fixture_yaw
+    } else {
+        options.yaw
+    };
+    let pitch = if custom_fixture && options.pos.is_none() {
+        fixture_pitch
+    } else {
+        options.pitch
+    };
     let target = OffscreenTarget::new(&gpu.device, options.width, options.height)?;
     log::info!("snapshot: mesher={}", options.mesher.name());
     let chunks = build_terrain(
@@ -70,15 +98,30 @@ fn main() -> anyhow::Result<()> {
         options.radius,
         &options.edits,
         options.mesher,
+        options.fixture,
     )?;
+    let world_time = options
+        .world_time
+        .or_else(|| options.day_phase.map(|phase| phase * DAY_LENGTH_SECONDS))
+        .unwrap_or(0.0);
     let globals = make_globals(
         position,
-        options.yaw,
-        options.pitch,
+        yaw,
+        pitch,
         options.width,
         options.height,
+        world_time,
     );
-    renderer.render(&target.color_view, &target.depth_view, &globals, &chunks);
+    renderer.render_view(
+        &target.color_view,
+        &target.depth_view,
+        &globals,
+        &chunks,
+        match options.view {
+            View::Final => RenderView::Final,
+            View::Light => RenderView::Light,
+        },
+    );
     let pixels = target.read_pixels(&gpu.device, &gpu.queue)?;
     image::save_buffer_with_format(
         &options.out,
@@ -105,30 +148,37 @@ fn build_terrain(
     radius: i32,
     edits: &[Edit],
     mesher: MesherMode,
+    fixture: Fixture,
 ) -> anyhow::Result<Vec<GpuChunkMeshes>> {
     let center = chunk_of(IVec3::new(
         position.x.floor() as i32,
         position.y.floor() as i32,
         position.z.floor() as i32,
     ));
-    let mut world = World::new(seed);
-    for z in center.z - radius..=center.z + radius {
-        for x in center.x - radius..=center.x + radius {
-            for y in 0..WORLD_CHUNKS_Y {
-                world.ensure_loaded(IVec3::new(x, y, z));
+    let mut world = if matches!(fixture, Fixture::Terrain) {
+        let mut world = World::new(seed);
+        for z in center.z - radius..=center.z + radius {
+            for x in center.x - radius..=center.x + radius {
+                for y in 0..WORLD_CHUNKS_Y {
+                    world.ensure_loaded(IVec3::new(x, y, z));
+                }
             }
         }
-    }
+        world
+    } else {
+        fixtures::build(seed, fixture)
+    };
 
     for edit in edits {
-        if !world.set_block(edit.position, edit.id) {
-            anyhow::bail!(
-                "edit position {:?} is outside the loaded world or vertical bounds",
-                edit.position
-            );
+        if let EditOutcome::Noop(warning) = apply_edit(&mut world, *edit)? {
+            log::warn!("{warning}");
         }
     }
 
+    let mut streamer = Streamer::new();
+    streamer
+        .solve_lighting_sync(&mut world)
+        .map_err(anyhow::Error::msg)?;
     let mut dirty = world.take_dirty();
     dirty.sort_by_key(|cp| {
         (
@@ -157,7 +207,50 @@ fn build_terrain(
     Ok(gpu_chunks)
 }
 
-fn make_globals(position: Vec3, yaw: f32, pitch: f32, width: u32, height: u32) -> Globals {
+#[derive(Debug, PartialEq, Eq)]
+enum EditOutcome {
+    Changed,
+    Noop(String),
+}
+
+fn apply_edit(world: &mut World, edit: Edit) -> anyhow::Result<EditOutcome> {
+    if edit.position.y < 0 || edit.position.y >= CHUNK_SIZE * WORLD_CHUNKS_Y {
+        anyhow::bail!(
+            "edit position {:?} is outside the loaded world or vertical bounds",
+            edit.position
+        );
+    }
+    let cp = chunk_of(edit.position);
+    if !world.is_loaded(cp) {
+        anyhow::bail!(
+            "edit position {:?} is outside the loaded world or vertical bounds",
+            edit.position
+        );
+    }
+    let existing = world.get_block(edit.position);
+    if existing == edit.id {
+        return Ok(EditOutcome::Noop(format!(
+            "snapshot edit at {:?} is a no-op; existing id {}",
+            edit.position, existing
+        )));
+    }
+    if !world.set_block(edit.position, edit.id) {
+        anyhow::bail!(
+            "edit position {:?} is outside the loaded world or vertical bounds",
+            edit.position
+        );
+    }
+    Ok(EditOutcome::Changed)
+}
+
+fn make_globals(
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+    world_time: f32,
+) -> Globals {
     let view = glam::camera::rh::view::look_to_mat4(position, forward(yaw, pitch), Vec3::Y);
     let projection = glam::camera::rh::proj::directx::perspective(
         FOV_Y,
@@ -165,13 +258,13 @@ fn make_globals(position: Vec3, yaw: f32, pitch: f32, width: u32, height: u32) -
         NEAR,
         FAR,
     );
-    Globals::new(
+    Globals::from_day(
         projection * view,
         position,
-        Vec3::new(-0.4, -1.0, -0.3).normalize(),
-        0.0,
+        world_time,
         width as f32,
         height as f32,
+        day_state(world_time),
     )
 }
 
@@ -198,6 +291,10 @@ where
         out: PathBuf::from(DEFAULT_OUT),
         edits: Vec::new(),
         mesher: MesherMode::Greedy,
+        fixture: Fixture::Terrain,
+        view: View::Final,
+        day_phase: None,
+        world_time: None,
     };
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
@@ -230,14 +327,33 @@ where
                     other => anyhow::bail!("--mesher must be culled or greedy, got {other:?}"),
                 };
             }
+            "--fixture" => options.fixture = Fixture::parse(&value()?)?,
+            "--view" => options.view = View::parse(&value()?)?,
+            "--day-phase" => {
+                let phase: f32 = value()?.parse().context("--day-phase must be a number")?;
+                if !(0.0..=1.0).contains(&phase) {
+                    anyhow::bail!("--day-phase must be between 0 and 1");
+                }
+                options.day_phase = Some(phase);
+            }
+            "--world-time" => {
+                let time: f32 = value()?.parse().context("--world-time must be a number")?;
+                if !time.is_finite() || time < 0.0 {
+                    anyhow::bail!("--world-time must be a non-negative finite number");
+                }
+                options.world_time = Some(time);
+            }
             "--help" | "-h" => {
                 println!(
-                    "snapshot [--seed N] [--pos X,Y,Z] [--yaw R] [--pitch R] [--radius N] [--size WxH] [--out PATH] [--edits \"set X,Y,Z,ID; ...\"] [--mesher culled|greedy]"
+                    "snapshot [--fixture terrain|m6-light-room|m6-wind] [--view final|light] [--day-phase 0..1|--world-time SEC] [--seed N] [--pos X,Y,Z] [--yaw R] [--pitch R] [--radius N] [--size WxH] [--out PATH] [--edits \"set X,Y,Z,ID; ...\"] [--mesher culled|greedy]"
                 );
                 std::process::exit(0);
             }
             _ => anyhow::bail!("unknown argument: {flag}"),
         }
+    }
+    if options.day_phase.is_some() && options.world_time.is_some() {
+        anyhow::bail!("--day-phase and --world-time are mutually exclusive");
     }
     Ok(options)
 }
@@ -282,8 +398,8 @@ fn parse_edits(value: &str) -> anyhow::Result<Vec<Edit>> {
         let id = fields[3]
             .parse::<BlockId>()
             .with_context(|| format!("edit block id must be an integer: {:?}", fields[3]))?;
-        if id > COBBLE {
-            anyhow::bail!("edit block id must be between {AIR} and {COBBLE}: {id}");
+        if id > TORCH {
+            anyhow::bail!("edit block id must be between {AIR} and {TORCH}: {id}");
         }
         edits.push(Edit { position, id });
     }
@@ -314,4 +430,68 @@ fn parse_size(value: &str) -> anyhow::Result<(u32, u32)> {
         anyhow::bail!("--size dimensions must be non-zero");
     }
     Ok((width, height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voxelforge::world::block::STONE;
+
+    #[test]
+    fn snapshot_noop_edit_is_warning() {
+        let mut world = World::new(DEFAULT_SEED);
+        let position = IVec3::new(0, 0, 0);
+        world.ensure_loaded(chunk_of(position));
+        let existing = world.get_block(position);
+        assert_eq!(existing, STONE);
+
+        let outcome = apply_edit(
+            &mut world,
+            Edit {
+                position,
+                id: existing,
+            },
+        )
+        .expect("same-ID edit should be accepted as a warning");
+        let EditOutcome::Noop(warning) = outcome else {
+            panic!("same-ID edit should return its warning outcome");
+        };
+        assert!(warning.contains("IVec3(0, 0, 0)"));
+        assert!(warning.contains("existing id 1"));
+    }
+
+    #[test]
+    fn snapshot_fixture_and_view_flags_parse() {
+        let options = parse_args([
+            "--fixture".into(),
+            "m6-light-room".into(),
+            "--view".into(),
+            "light".into(),
+            "--day-phase".into(),
+            "0.25".into(),
+            "--edits".into(),
+            "set 0,0,0,12".into(),
+        ])
+        .expect("fixture flags should parse");
+        assert_eq!(options.fixture, Fixture::LightRoom);
+        assert_eq!(options.view, View::Light);
+        assert_eq!(options.day_phase, Some(0.25));
+        assert_eq!(options.world_time, None);
+        assert_eq!(options.edits[0].id, TORCH);
+    }
+
+    #[test]
+    fn snapshot_rejects_two_time_controls() {
+        let result = parse_args([
+            "--day-phase".into(),
+            "0.25".into(),
+            "--world-time".into(),
+            "10".into(),
+        ]);
+        let error = match result {
+            Ok(_) => panic!("day phase and world time must be exclusive"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("mutually exclusive"));
+    }
 }

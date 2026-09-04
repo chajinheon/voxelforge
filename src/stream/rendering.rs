@@ -1,6 +1,7 @@
 use crate::mesh::ChunkMeshes;
 use crate::render::{GpuChunkMeshes, Renderer};
 use crate::world::coords::{CHUNK_SIZE, chunk_of};
+use crate::world::light::LightColumn;
 use crate::world::world::World;
 
 use super::Streamer;
@@ -13,6 +14,9 @@ impl Streamer {
         gpu_chunks: &mut Vec<GpuChunkMeshes>,
         cp: glam::IVec3,
     ) {
+        if !world.light_column_initialized(LightColumn { x: cp.x, z: cp.z }) {
+            return;
+        }
         if world.chunk(cp).is_some_and(|chunk| chunk.is_empty()) {
             self.remove_gpu_chunk(renderer, gpu_chunks, cp);
             return;

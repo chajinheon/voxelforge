@@ -6,7 +6,19 @@ use crate::world::{
     coords::{FACE_NORMALS, face_corners},
 };
 
-use super::mesher::{ChunkMesh, ChunkMeshes, append_quad_with_lowered, face_ao, lowered_pattern};
+use super::mesher::{
+    ChunkMesh, ChunkMeshes, append_quad_with_lowered, corner_light, face_ao, lowered_pattern,
+};
+use crate::world::block::{GRASS, LEAVES};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FaceKey {
+    pub tex: u16,
+    pub ao: [u8; 4],
+    pub block_light: [u8; 4],
+    pub sky_light: [u8; 4],
+    pub lowered: [bool; 4],
+}
 
 // For each face, the two axes point from corner 0 to corners 1 and 3.
 const BASIS: [(usize, i32, usize, i32, usize, i32); 6] = [
@@ -36,7 +48,7 @@ fn face_cell(
     face: usize,
     bp: IVec3,
     translucent_pass: bool,
-) -> Option<([u32; 4], u32, [bool; 4])> {
+) -> Option<(FaceKey, bool)> {
     let id = padded.get(bp.x, bp.y, bp.z);
     let block = def(id);
     if id == AIR || block.name == "air" || block.translucent != translucent_pass {
@@ -48,18 +60,31 @@ fn face_cell(
         return None;
     }
     let corners = face_corners(face, bp);
+    let mut block_light = [0u8; 4];
+    let mut sky_light = [0u8; 4];
+    for (i, corner) in corners.into_iter().enumerate() {
+        let (block, sky) = corner_light(padded, bp, face, corner, id);
+        block_light[i] = block as u8;
+        sky_light[i] = sky as u8;
+    }
     Some((
-        [
-            face_ao(padded, bp, face, corners[0]),
-            face_ao(padded, bp, face, corners[1]),
-            face_ao(padded, bp, face, corners[2]),
-            face_ao(padded, bp, face, corners[3]),
-        ],
-        block.textures[face] as u32,
-        lowered_pattern(
-            id == crate::world::block::WATER && padded.get(bp.x, bp.y + 1, bp.z) != id,
-            face,
-        ),
+        FaceKey {
+            ao: [
+                face_ao(padded, bp, face, corners[0]),
+                face_ao(padded, bp, face, corners[1]),
+                face_ao(padded, bp, face, corners[2]),
+                face_ao(padded, bp, face, corners[3]),
+            ]
+            .map(|value| value as u8),
+            tex: block.textures[face],
+            block_light,
+            sky_light,
+            lowered: lowered_pattern(
+                id == crate::world::block::WATER && padded.get(bp.x, bp.y + 1, bp.z) != id,
+                face,
+            ),
+        },
+        (id == LEAVES) || (id == GRASS && face == 2),
     ))
 }
 
@@ -86,10 +111,10 @@ fn mesh_chunk_greedy_pass(padded: &PaddedChunk, translucent_pass: bool) -> Chunk
             let mut mask = [[None; 32]; 32];
             for (v, row) in mask.iter_mut().enumerate() {
                 for (u, cell) in row.iter_mut().enumerate() {
-                    if let Some((ao, tex, lowered)) =
+                    if let Some((key, eligible)) =
                         face_cell(padded, face, cell_bp(face, layer, u, v), translucent_pass)
                     {
-                        *cell = Some((ao, tex, lowered));
+                        *cell = Some((key, eligible));
                     }
                 }
             }
@@ -103,11 +128,12 @@ fn mesh_chunk_greedy_pass(padded: &PaddedChunk, translucent_pass: bool) -> Chunk
                         continue;
                     };
                     let mut width = 1;
-                    while u + width < 32 && mask[v][u + width] == Some(key) {
+                    let cap = if key.1 { 4 } else { 32 };
+                    while u + width < 32 && width < cap && mask[v][u + width] == Some(key) {
                         width += 1;
                     }
                     let mut height = 1;
-                    'grow: while v + height < 32 {
+                    'grow: while v + height < 32 && height < cap {
                         for cell in &mask[v + height][u..u + width] {
                             if *cell != Some(key) {
                                 break 'grow;
@@ -126,8 +152,17 @@ fn mesh_chunk_greedy_pass(padded: &PaddedChunk, translucent_pass: bool) -> Chunk
                         corners[0] + e1 * width as i32 + e2 * height as i32,
                         corners[0] + e2 * height as i32,
                     ];
-                    let ao = [key.0[0], key.0[1], key.0[2], key.0[3]];
-                    append_quad_with_lowered(&mut mesh, quad, face, ao, key.1, key.2);
+                    let face_key = key.0;
+                    append_quad_with_lowered(
+                        &mut mesh,
+                        quad,
+                        face,
+                        face_key.ao.map(u32::from),
+                        face_key.tex as u32,
+                        face_key.block_light.map(u32::from),
+                        face_key.sky_light.map(u32::from),
+                        face_key.lowered,
+                    );
                     for row in &mut mask[v..v + height] {
                         for cell in &mut row[u..u + width] {
                             *cell = None;
@@ -200,6 +235,19 @@ mod tests {
         textures.sort_unstable();
         textures.dedup();
         assert_eq!(textures.len(), 2);
+    }
+
+    #[test]
+    fn greedy_never_merges_different_light_keys() {
+        let mut p = PaddedChunk::new();
+        p.set(0, 0, 0, STONE);
+        p.set(1, 0, 0, STONE);
+        // Both +Y faces are otherwise identical, but their front corner light differs.
+        p.set_light(0, 1, 0, crate::world::chunk::pack_light(3, 7));
+        p.set_light(1, 1, 0, crate::world::chunk::pack_light(9, 7));
+        let mesh = mesh_chunk_greedy(&p);
+        let top = mesh.vertices.iter().filter(|v| unpack(**v).3 == 2).count();
+        assert_eq!(top, 8, "different corner light keys must produce two quads");
     }
 
     #[test]

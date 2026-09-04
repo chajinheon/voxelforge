@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -7,14 +6,17 @@ use std::time::{Duration, Instant};
 use glam::IVec3;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
-use crate::mesh::{ChunkMeshes, mesh_chunk_greedy_all};
+use crate::mesh::ChunkMeshes;
 use crate::render::{GpuChunkMeshes, Renderer};
-use crate::world::chunk::PaddedChunk;
 use crate::world::coords::WORLD_CHUNKS_Y;
-use crate::world::r#gen::WorldGen;
+use crate::world::light::LightColumn;
 use crate::world::save::SaveDir;
 use crate::world::world::World;
 
+use self::jobs::{Job, ResultMessage};
+
+mod jobs;
+mod lighting;
 mod persistence;
 mod rendering;
 
@@ -25,40 +27,6 @@ const URGENT_BUDGET: usize = 3;
 const MAIN_BUDGET: Duration = Duration::from_millis(6);
 const GEN_PUMP_BUDGET: Duration = Duration::from_millis(4);
 
-enum Job {
-    Gen {
-        cp: IVec3,
-        generator: Arc<WorldGen>,
-    },
-    Load {
-        cp: IVec3,
-        save: SaveDir,
-    },
-    Mesh {
-        cp: IVec3,
-        padded: Box<PaddedChunk>,
-        version: u64,
-        epoch: u64,
-    },
-}
-
-enum ResultMessage {
-    Gen {
-        cp: IVec3,
-        chunk: crate::world::chunk::Chunk,
-    },
-    Load {
-        cp: IVec3,
-        result: Result<Option<crate::world::chunk::Chunk>, String>,
-    },
-    Mesh {
-        cp: IVec3,
-        version: u64,
-        epoch: u64,
-        mesh: ChunkMeshes,
-    },
-}
-
 pub struct Streamer {
     pool: ThreadPool,
     sender: Sender<ResultMessage>,
@@ -66,10 +34,20 @@ pub struct Streamer {
     gen_inflight: HashSet<IVec3>,
     load_inflight: HashSet<IVec3>,
     mesh_inflight: HashSet<IVec3>,
+    pub(crate) light_pending: VecDeque<LightColumn>,
+    pub(crate) light_next_pending: HashSet<LightColumn>,
+    pub(crate) light_inflight: HashSet<LightColumn>,
+    light_urgent: HashSet<LightColumn>,
+    light_solve_counts: HashMap<(LightColumn, u64), u32>,
+    light_columns_seen: HashSet<LightColumn>,
+    light_solves: usize,
+    light_times: Vec<Duration>,
+    max_light_requeues: u32,
     mesh_epochs: HashMap<IVec3, u64>,
     next_mesh_epoch: u64,
     dirty: HashMap<IVec3, bool>,
     completed_meshes: VecDeque<(IVec3, u64, u64, ChunkMeshes)>,
+    pub(crate) completed_lights: VecDeque<(crate::world::light::LightColumnResult, Duration)>,
     radius: i32,
     started: Instant,
     settled: bool,
@@ -96,10 +74,20 @@ impl Streamer {
             gen_inflight: HashSet::new(),
             load_inflight: HashSet::new(),
             mesh_inflight: HashSet::new(),
+            light_pending: VecDeque::new(),
+            light_next_pending: HashSet::new(),
+            light_inflight: HashSet::new(),
+            light_urgent: HashSet::new(),
+            light_solve_counts: HashMap::new(),
+            light_columns_seen: HashSet::new(),
+            light_solves: 0,
+            light_times: Vec::new(),
+            max_light_requeues: 0,
             mesh_epochs: HashMap::new(),
             next_mesh_epoch: 0,
             dirty: HashMap::new(),
             completed_meshes: VecDeque::new(),
+            completed_lights: VecDeque::new(),
             radius: configured_radius(),
             started: Instant::now(),
             settled: false,
@@ -117,12 +105,17 @@ impl Streamer {
             + self.gen_inflight.len()
             + self.load_inflight.len()
             + self.mesh_inflight.len()
+            + self.light_pending.len()
+            + self.light_next_pending.len()
+            + self.light_inflight.len()
+            + self.completed_lights.len()
             + self.completed_meshes.len()
     }
 
     pub fn mark_urgent(&mut self, cp: IVec3) {
         self.bump_mesh_epoch(cp);
         self.dirty.insert(cp, true);
+        self.mark_light_urgent(cp);
     }
 
     pub fn bootstrap(
@@ -137,6 +130,9 @@ impl Streamer {
             if !world.is_loaded(*cp) {
                 self.load_or_generate(world, *cp);
             }
+        }
+        if let Err(error) = self.solve_lighting_sync(world) {
+            log::error!("bootstrap lighting failed: {error}");
         }
         world.take_dirty();
         self.dirty.clear();
@@ -155,9 +151,10 @@ impl Streamer {
     ) {
         let desired = self.desired_set(center);
         self.drain_results(world, &desired);
+        let budget_start = Instant::now();
         self.collect_dirty(world);
         self.pump_generation(world, &desired, center);
-        let budget_start = Instant::now();
+        self.pump_lighting(world, &desired, center, budget_start);
         // Edited chunks are synchronous and take priority over queued worker
         // results and new regular mesh copies, so an edit is visible this frame.
         self.mesh_urgent(world, renderer, gpu_chunks, &desired, center, budget_start);
@@ -224,6 +221,12 @@ impl Streamer {
                         self.dirty.entry(cp).or_insert(false);
                     }
                 }
+                // M6.1 defines the worker result now; scheduling and applying
+                // lighting remain M6.2 responsibilities.
+                ResultMessage::Light { result, elapsed } => {
+                    self.light_inflight.remove(&result.column);
+                    self.completed_lights.push_back((result, elapsed));
+                }
             }
         }
     }
@@ -276,7 +279,7 @@ impl Streamer {
         let started = Instant::now();
 
         loop {
-            while self.gen_inflight.len() + self.load_inflight.len() < limit {
+            while self.total_inflight() < limit {
                 let Some(cp) = missing.pop_front() else {
                     break;
                 };
@@ -319,8 +322,10 @@ impl Streamer {
         center: IVec3,
         budget_start: Instant,
     ) {
-        let limit = self.worker_limit();
-        let available = limit.saturating_sub(self.mesh_inflight.len());
+        if self.lighting_busy() {
+            return;
+        }
+        let available = self.total_limit().saturating_sub(self.total_inflight());
         if available == 0 {
             return;
         }
@@ -329,6 +334,7 @@ impl Streamer {
             .iter()
             .filter(|(cp, urgent)| {
                 desired.contains(cp)
+                    && world.light_column_initialized(LightColumn { x: cp.x, z: cp.z })
                     && !**urgent
                     && !self.mesh_inflight.contains(cp)
                     && !self
@@ -391,10 +397,15 @@ impl Streamer {
             if budget_start.elapsed() >= MAIN_BUDGET {
                 break;
             }
+            if !world.light_column_initialized(LightColumn { x: cp.x, z: cp.z }) {
+                continue;
+            }
             self.dirty.remove(&cp);
             if world.chunk(cp).is_some_and(|chunk| chunk.is_empty()) {
                 self.remove_gpu_chunk(renderer, gpu_chunks, cp);
-            } else if world.is_loaded(cp) {
+            } else if world.is_loaded(cp)
+                && world.light_column_initialized(LightColumn { x: cp.x, z: cp.z })
+            {
                 self.mesh_and_upload(world, renderer, gpu_chunks, cp);
             }
         }
@@ -402,30 +413,7 @@ impl Streamer {
 
     fn spawn(&self, job: Job) {
         let sender = self.sender.clone();
-        self.pool.spawn(move || match job {
-            Job::Gen { cp, generator } => {
-                let chunk = generator.generate(cp);
-                let _ = sender.send(ResultMessage::Gen { cp, chunk });
-            }
-            Job::Load { cp, save } => {
-                let result = save.read_chunk(cp).map_err(|error| format!("{error:#}"));
-                let _ = sender.send(ResultMessage::Load { cp, result });
-            }
-            Job::Mesh {
-                cp,
-                padded,
-                version,
-                epoch,
-            } => {
-                let mesh = mesh_chunk_greedy_all(&padded);
-                let _ = sender.send(ResultMessage::Mesh {
-                    cp,
-                    version,
-                    epoch,
-                    mesh,
-                });
-            }
-        });
+        self.pool.spawn(move || jobs::execute(job, sender));
     }
 
     fn bump_mesh_epoch(&mut self, cp: IVec3) {
@@ -438,13 +426,20 @@ impl Streamer {
             || !self.gen_inflight.is_empty()
             || !self.load_inflight.is_empty()
             || !self.mesh_inflight.is_empty()
+            || !self.light_pending.is_empty()
+            || !self.light_inflight.is_empty()
+            || !self.completed_lights.is_empty()
             || !self.completed_meshes.is_empty()
             || !self.dirty.is_empty()
-            || !desired.iter().all(|&cp| world.is_loaded(cp))
+            || !desired.iter().all(|&cp| {
+                world.is_loaded(cp)
+                    && world.light_column_initialized(LightColumn { x: cp.x, z: cp.z })
+            })
         {
             return;
         }
         self.settled = true;
+        self.log_lighting_stats();
         log::info!(
             "stream: settled in {:.2}s ({} chunks, {} drawn)",
             self.started.elapsed().as_secs_f64(),
@@ -454,7 +449,27 @@ impl Streamer {
     }
 
     fn worker_limit(&self) -> usize {
-        self.pool.current_num_threads() * 2
+        self.total_limit()
+    }
+
+    fn worker_threads(&self) -> usize {
+        self.pool.current_num_threads()
+    }
+    fn total_limit(&self) -> usize {
+        self.worker_threads() * 2
+    }
+    fn total_inflight(&self) -> usize {
+        self.gen_inflight.len()
+            + self.load_inflight.len()
+            + self.light_inflight.len()
+            + self.mesh_inflight.len()
+    }
+
+    fn lighting_busy(&self) -> bool {
+        !self.light_pending.is_empty()
+            || !self.light_next_pending.is_empty()
+            || !self.light_inflight.is_empty()
+            || !self.completed_lights.is_empty()
     }
 }
 

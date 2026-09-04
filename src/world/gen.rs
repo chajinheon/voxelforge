@@ -6,6 +6,7 @@ use fastnoise_lite::{FastNoiseLite, FractalType, NoiseType};
 use glam::IVec3;
 
 pub const SEA_LEVEL: i32 = 62;
+pub const MAX_GEN_CHUNK_Y: i32 = 4;
 
 pub struct WorldGen {
     seed: u64,
@@ -37,7 +38,7 @@ impl WorldGen {
     }
     pub fn generate(&self, cp: IVec3) -> Chunk {
         let mut chunk = Chunk::new_air();
-        if cp.y >= 4 {
+        if cp.y >= MAX_GEN_CHUNK_Y {
             return chunk;
         }
         let mut heights = [0; (CHUNK_SIZE * CHUNK_SIZE) as usize];
@@ -219,5 +220,18 @@ mod tests {
             crossed[cp.x as usize] = true;
         }
         assert!(crossed.into_iter().all(|value| value));
+    }
+
+    #[test]
+    fn max_gen_chunk_y_covers_generated_content() {
+        assert_eq!(MAX_GEN_CHUNK_Y, 4);
+        let generator = WorldGen::new(1);
+        for cp_y in 4..crate::world::coords::WORLD_CHUNKS_Y {
+            let chunk = generator.generate(IVec3::new(17, cp_y, -9));
+            assert!(
+                chunk.blocks.iter().all(|&id| id == AIR),
+                "generated chunk at y={cp_y} contains non-air content"
+            );
+        }
     }
 }

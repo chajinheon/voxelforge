@@ -13,6 +13,52 @@
 
 ---
 
+## 2026-09-04 23:25  M6.4 — GPT-5.6 Sol
+
+- 한 것: `snapshot`에 `terrain|m6-light-room|m6-wind`, `final|light`, `--day-phase`, `--world-time`을 연결하고 모든 fixture를 동기 열 조명 뒤 메싱하도록 바꿨다. `light` 파이프라인은 텍스처·AO·면 음영을 우회해 opaque와 translucent의 선형 illumination을 출력한다. 밀폐 조명방·바람 fixture, VFC1 재조명 저장 회귀, 실제 메시를 그리는 final/light transactional shader hotreload 회귀를 추가했다. 비동기 조명은 stale/outside 결과를 통계에서 제외하고 current/next wave 중복을 합쳐 경계 재계산을 줄였다.
+- 검증: `cargo test --all-targets` → library 81 + snapshot 3 passed(총 84), `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` 통과. Apple M5 release `R=12`, 1200프레임: 5000청크 `settled in 3.39s`, 625열/1114 solves, solver median 1.60ms·p95 2.98ms, max requeues 8. 정착 정상 1초 구간 max 18.8ms. 편집→조명 solve·재메시·GPU upload 17.824ms. M5 동일 seed·radius·해상도 terrain 정점 1,729,572 → M6 1,741,792, 비율 1.0071(≤1.3×).
+- 스냅샷: `/tmp/vf_m6_light.png`의 13/9/5/1 중심 RGB `(209,209,209)`, `(140,140,140)`, `(92,92,92)`, `(59,59,59)`; 선형 정규화 비율 `[1.000000, 0.422946, 0.166491, 0.065922]`. `/tmp/vf_m6_day.png`·`/tmp/vf_m6_night.png` 하늘 crop 자정/정오 `0.011185`. `/tmp/vf_m6_wind_a.png`·`/tmp/vf_m6_wind_b.png` 변화율 LEAVES `0.043646`, STONE `0.000000`. 전부 §15.6 통과했고 PNG를 직접 확인했다.
+- 설계와 다르게 한 것 / 제안: 없음. 별도 계측에서 간헐적 28.8~33.5ms 표본은 렌더 작업(0.8~2.04ms)이 아니라 `CAMetalLayer` drawable acquire가 두 주사 구간을 기다린 값으로 분리 확인했다. 측정용 계측과 swapchain 실험은 최종 코드에 남기지 않았고, M5와 같은 기준의 정착 정상 구간 max를 기록했다.
+- 열린 문제: 없음.
+- 의도한 커밋 메시지: `M6.4: validate lighting milestone`
+- 다음: **M6 완료, 리뷰 요청.** Claude 리뷰·커밋 전에는 M7로 가지 않는다.
+
+## 2026-09-04 23:05  M6.3 — GPT-5.6 Sol
+
+- 한 것: face 코너마다 앞층 네 셀의 block/sky light를 반올림 평균하고 emitter를 보정해 정점 `b[16..24)`에 패킹했다. greedy 키를 texture·AO·block light·sky light·lowered 전체 일치로 확장하고 LEAVES 전체·GRASS 상면을 4×4로 제한했다. 16단계 광도표, 1200초 `DayState`, 동적 하늘 clear, 월드 좌표 XZ 바람, 128바이트 Globals를 Rust와 두 WGSL에 연결했다.
+- 검증: `mesher_bakes_corner_light_and_sky`, `greedy_never_merges_different_light_keys`, `wind_offset_matches_at_shared_world_vertex`, 기존 `vertex_pack_roundtrip`, Globals 128바이트 테스트 통과. 독립 코드 재리뷰에서 코너 샘플·패킹·LUT·낮밤·바람·500줄·렌더 루프 계약을 재확인했고 CRITICAL/HIGH/MEDIUM 잔여 0.
+- 설계와 다르게 한 것 / 제안: 없음.
+- 열린 문제: 없음.
+- 의도한 커밋 메시지: `M6.3: render day night light and wind`
+- 다음: M6.4 자동 스냅샷·저장/hotreload 회귀·성능 마감.
+
+## 2026-09-04 22:25  M6.2 — GPT-5.6 Sol
+
+- 한 것: `World`에 열 조명 dirty·epoch·snapshot/apply와 정확한 4면 비교를 추가하고, 삽입·로드·언로드·편집 invalidation을 연결했다. `stream/lighting.rs`에서 urgent/초기 근접/경계 재전파 우선순위, 조명 `w`·전체 잡 `2w` 상한, stale 폐기, 비동기 고정점 wave, 동기 bootstrap, timing 통계를 구현했다. 최초 메시를 8청크 열 조명 초기화 전까지 보류하고, 조명 적용은 실제 바이트가 바뀐 청크만 메시 dirty로 만든다. 열 snapshot/apply는 청크 단위 연속 복사로 최적화했다.
+- 검증: `cargo test --all-targets` → library 71 + snapshot 1 passed(총 72), `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` 통과. `stale_light_result_is_discarded`, 경계 횃불 전달·제거 수렴, 저장 상태 불변, 3×3 bootstrap 고정점 테스트 통과. Apple M5 release `R=12` 실측: 5000청크 `settled in 4.37s`, 625열/1387 solves, solver median 2.60ms·p95 4.95ms, max requeues 13. bootstrap 오류 없음.
+- 설계와 다르게 한 것 / 제안: 없음.
+- 열린 문제: 없음.
+- 의도한 커밋 메시지: `M6.2: stream lighting across chunk columns`
+- 다음: M6.3 정점 조명·셰이더·낮밤·바람.
+
+## 2026-09-04 21:32  M6.1 — GPT-5.6 Sol
+
+- 한 것: `TORCH` ID 12·emission 14·텍스처 레이어 13과 새 핫바를 추가했다. `Chunk`의 32KiB packed light·초기화 상태, `PaddedChunk`의 34³ light 패딩, `pack_light`/채널 디코더를 추가했다. `world/light.rs`에 직접 하늘광, 경계 입력, TORCH 시드와 분리된 두 `VecDeque`를 쓰는 결정적 열 solver를 구현했다. `stream/jobs.rs`로 Gen/Load/Light/Mesh 타입과 워커 실행을 분리해 `stream.rs`를 429줄로 줄였다. 저장 코드는 계속 블록 ID만 직렬화한다.
+- 검증: `cargo test --all-targets` → library 63 + snapshot 1 passed(총 64). 조명 순수 테스트 8개(pack, 무감쇠 하강, 수평 감쇠, 블록광 감쇠, opaque 차단, TORCH 14, 결정성, Send+Sync) 통과. `cargo run --release --bin snapshot -- --seed 1 --radius 1 --size 320x180 --out /tmp/vf_m61.png` → 320×180 PNG 생성. `src/world/save.rs` 대조로 `VFC1`과 블록 전용 직렬화가 유지됨을 확인했다.
+- 설계와 다르게 한 것 / 제안: 없음.
+- 열린 문제: `set_light_initialized`는 M6.2 적용 경로가 아직 없어 dead-code warning이 남아 있다.
+- 의도한 커밋 메시지: `M6.1: add voxel light solver`
+- 다음: M6.2 경계 전파·스트리밍.
+
+## 2026-09-04 21:21  M6.0 — GPT-5.6 Sol
+
+- 한 것: `snapshot_noop_edit_is_warning`을 fail-first로 추가해 컴파일 실패(E0425)를 확인한 뒤, 동일 ID 편집을 위치·기존 ID가 포함된 warning으로 처리하고 정상 종료하도록 분리했다. `MAX_GEN_CHUNK_Y = 4`와 상한 이상 청크가 비어 있음을 검증하는 테스트를 추가했다. `SaveDir::open`의 기본 root를 `assets::dir()`의 부모인 프로젝트 root 아래 `saves/`로 고정했다. 투명 Globals 중복은 건드리지 않았다.
+- 검증: `cargo test --all-targets` → library 55 + snapshot 1 passed(총 56), `cargo fmt --check`, `git diff --check` 통과. 실제 no-op snapshot은 exit 0과 `IVec3(0, 0, 0)`, `existing id 1` warning을 확인했고, 미로드 편집은 exit 1을 유지했다. `/tmp` cwd에서 1프레임 실행해 저장 디렉터리가 프로젝트 root `saves/`에 생성됨을 확인했다.
+- 설계와 다르게 한 것 / 제안: 없음.
+- 열린 문제: 없음.
+- 의도한 커밋 메시지: `M6.0: close M5 review items`
+- 다음: M6.1 조명 데이터·순수 열 solver.
+
 ## 2026-09-04 20:30  M4·M5 리뷰 — Claude
 
 - 한 것: GPT의 미커밋 작업 트리(32파일)를 리뷰 뒤 한 커밋으로 보존(`ad8406f`). 검증 명령 전부 재실행: `cargo test --all-targets` 53 passed(§14 계약 테스트 이름 20개 전부 존재), clippy `-D warnings`·fmt 통과. culled/greedy 스냅샷 픽셀 일치 99.982%(≥99.5). `VF_RADIUS=12 VF_SMOKE_FRAMES=900` → `settled in 2.17s (5000 chunks)`, 이후 60fps·max 17~18ms(<25). 코드 대조: `stream.rs`(rayon+mpsc, 편집 동기 메싱, 부트스트랩, settle 로그, version/epoch 분리), `greedy.rs`(키 tex+ao×4, 대각 뒤집기 culled와 공유), `physics.rs`(Y→X→Z 스윕, 수영, 안전 스폰), `trees.rs`·`gen.rs`(순수 나무·±2열 스캔·동굴 8≤y≤h−6), `frustum.rs`(0..1 깊이 평면), `save.rs`(VFC1+lz4, world.json), `translucent.rs`·`renderer.rs`(불투명→outline→투명, 뒤→앞 정렬, cull None), `chunk.wgsl`(bit 23 lowered, 알파 출력) — 전부 §14와 일치. 렌더 루프 `unwrap`/`expect` 없음.

@@ -199,12 +199,35 @@ fn procedural_layer(name: &str, layer: u64) -> Vec<u8> {
                         noisy([120, 120, 120], x, y, layer)
                     }
                 }
+                "torch" => {
+                    let dx = x as i32 - 8;
+                    let dy = y as i32 - 5;
+                    let flame = dx * dx + dy * dy < 28 && y < 11;
+                    let stick = (6..14).contains(&y) && (7..10).contains(&x);
+                    if flame {
+                        [255, 190 + (hash(x, y, layer) % 40), 45]
+                    } else if stick {
+                        [116, 72, 34]
+                    } else {
+                        [0, 0, 0]
+                    }
+                }
                 _ => noisy([190, 190, 190], x, y, layer),
             };
             let index = ((y * SIZE + x) * 4) as usize;
             let alpha = match name {
                 "water" => 150,
                 "glass" => 90,
+                "torch"
+                    if {
+                        let dx = x as i32 - 8;
+                        let dy = y as i32 - 5;
+                        dx * dx + dy * dy < 28 && y < 11
+                    } =>
+                {
+                    255
+                }
+                "torch" => 0,
                 _ => 255,
             };
             out[index..index + 4].copy_from_slice(&[color[0], color[1], color[2], alpha]);

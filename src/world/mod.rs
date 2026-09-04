@@ -2,6 +2,7 @@ pub mod block;
 pub mod chunk;
 pub mod coords;
 pub mod r#gen;
+pub mod light;
 pub mod raycast;
 pub mod save;
 pub mod trees;

@@ -39,7 +39,7 @@ pub struct SaveDir {
 }
 
 impl SaveDir {
-    /// Open (and create) `saves/<name>/` in the current directory.
+    /// Open (and create) `saves/<name>/` under the project root.
     pub fn open(name: &str) -> Result<Self> {
         let mut components = Path::new(name).components();
         let valid = !name.is_empty()
@@ -50,7 +50,11 @@ impl SaveDir {
         if !valid {
             bail!("save name must be exactly one normal path component");
         }
-        let root = PathBuf::from("saves").join(name);
+        let assets_dir = crate::assets::dir();
+        let project_root = assets_dir
+            .parent()
+            .context("asset directory has no project root")?;
+        let root = project_root.join("saves").join(name);
         fs::create_dir_all(root.join(CHUNKS_DIR))
             .with_context(|| format!("create save directory {}", root.display()))?;
         Ok(Self { root })
@@ -237,5 +241,74 @@ mod tests {
                 "accepted invalid name {name:?}"
             );
         }
+    }
+
+    #[test]
+    fn save_root_is_project_root() {
+        let name = format!("m6-root-{}", std::process::id());
+        let save = SaveDir::open(&name).expect("open project-root save");
+        let assets_dir = crate::assets::dir();
+        let project_root = assets_dir
+            .parent()
+            .expect("asset directory has project root");
+        let saves_root = project_root.join("saves");
+        assert_eq!(save.root.parent(), Some(saves_root.as_path()));
+        assert_eq!(save.root, saves_root.join(&name));
+        fs::remove_dir_all(save.root).expect("remove project-root save");
+    }
+
+    #[test]
+    fn save_v1_relights_instead_of_serializing_light() {
+        let root = temp_root("relights");
+        let save = save_at(&root);
+        let cp = IVec3::new(2, 0, -3);
+        let mut original = Chunk::new_air();
+        original.set(UVec3::new(0, 0, 0), STONE);
+        original.set(UVec3::new(31, 31, 31), DIRT);
+        original.set_light(UVec3::new(0, 0, 0), super::super::chunk::pack_light(13, 7));
+        original.set_light(
+            UVec3::new(31, 31, 31),
+            super::super::chunk::pack_light(2, 1),
+        );
+        original.set_light_initialized(true);
+
+        // Exercise the production chunk writer, then inspect its actual bytes.
+        save.write_chunk(cp, &original).expect("write v1 chunk");
+        let encoded = fs::read(save.chunk_path(cp)).expect("read raw v1 chunk");
+        assert_eq!(&encoded[..CHUNK_MAGIC.len()], CHUNK_MAGIC);
+        let raw = lz4_flex::decompress_size_prepended(&encoded[CHUNK_MAGIC.len()..])
+            .expect("decompress v1 chunk");
+        assert_eq!(raw.len(), CHUNK_VOLUME * 2);
+        assert_eq!(&raw[..2], &STONE.to_le_bytes());
+        assert_eq!(
+            &raw[(CHUNK_VOLUME - 1) * 2..CHUNK_VOLUME * 2],
+            &DIRT.to_le_bytes()
+        );
+
+        // The production reader must recreate runtime lighting as zero/uninitialized.
+        let loaded = save
+            .read_chunk(cp)
+            .expect("read v1 chunk")
+            .expect("v1 chunk exists");
+        assert!(!loaded.light_initialized());
+        assert!(loaded.light.iter().all(|&value| value == 0));
+
+        let meta = WorldMeta {
+            version: 1,
+            seed: 7,
+            player: PlayerMeta {
+                pos: [0.0, 0.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                fly: false,
+            },
+        };
+        save.write_meta(&meta).expect("write v1 metadata");
+        let world_json = fs::read_to_string(root.join(META_FILE)).expect("read world.json");
+        let json: serde_json::Value = serde_json::from_str(&world_json).expect("parse world.json");
+        assert_eq!(json["version"], 1);
+        assert_eq!(save.read_meta().expect("read v1 metadata"), Some(meta));
+
+        fs::remove_dir_all(root).expect("remove temp save");
     }
 }

@@ -1,7 +1,8 @@
 use super::block::{AIR, BlockId, STONE};
-use super::chunk::{Chunk, PaddedChunk};
+use super::chunk::{Chunk, PaddedChunk, pack_light};
 use super::coords::{CHUNK_SIZE, WORLD_CHUNKS_Y, chunk_of, local_of};
 use super::r#gen::WorldGen;
+use super::light::LightColumn;
 use super::save::SaveDir;
 use anyhow::{Context, Result};
 use glam::IVec3;
@@ -13,9 +14,11 @@ pub struct World {
     pub(crate) generator: Arc<WorldGen>,
     seed: u64,
     versions: HashMap<IVec3, u64>,
-    dirty: HashSet<IVec3>,
+    pub(crate) dirty: HashSet<IVec3>,
     pub(crate) modified: HashSet<IVec3>,
     pub(crate) saved_version: HashMap<IVec3, u64>,
+    pub(crate) light_dirty: HashSet<LightColumn>,
+    pub(crate) light_epochs: HashMap<LightColumn, u64>,
 }
 
 impl World {
@@ -28,6 +31,8 @@ impl World {
             dirty: HashSet::new(),
             modified: HashSet::new(),
             saved_version: HashMap::new(),
+            light_dirty: HashSet::new(),
+            light_epochs: HashMap::new(),
         }
     }
 
@@ -58,6 +63,7 @@ impl World {
         *self.versions.entry(cp).or_insert(1) += 1;
         self.dirty.insert(cp);
         self.modified.insert(cp);
+        self.mark_light_dirty_edit(cp);
         for (axis, sign) in [
             (
                 0,
@@ -112,19 +118,8 @@ impl World {
         self.chunks.insert(cp, chunk);
         self.versions.insert(cp, 1);
         self.dirty.insert(cp);
-        for axis in 0..3 {
-            for sign in [-1, 1] {
-                let mut n = cp;
-                match axis {
-                    0 => n.x += sign,
-                    1 => n.y += sign,
-                    _ => n.z += sign,
-                }
-                if self.chunks.contains_key(&n) {
-                    self.dirty.insert(n);
-                }
-            }
-        }
+        self.mark_light_dirty_insert(cp);
+        self.mark_mesh_neighbors_dirty(cp);
     }
 
     /// Insert a chunk read from disk and retain its modified identity so later
@@ -138,19 +133,8 @@ impl World {
         self.saved_version.insert(cp, 1);
         self.modified.insert(cp);
         self.dirty.insert(cp);
-        for axis in 0..3 {
-            for sign in [-1, 1] {
-                let mut n = cp;
-                match axis {
-                    0 => n.x += sign,
-                    1 => n.y += sign,
-                    _ => n.z += sign,
-                }
-                if self.chunks.contains_key(&n) {
-                    self.dirty.insert(n);
-                }
-            }
-        }
+        self.mark_light_dirty_insert(cp);
+        self.mark_mesh_neighbors_dirty(cp);
     }
 
     pub fn chunk_version(&self, cp: IVec3) -> Option<u64> {
@@ -238,6 +222,36 @@ impl World {
                             .map_or(AIR, |chunk| chunk.get(local))
                     };
                     padded.set(x, y, z, id);
+                    let light = if bp.y < 0 {
+                        pack_light(0, 0)
+                    } else if bp.y >= CHUNK_SIZE * WORLD_CHUNKS_Y {
+                        pack_light(0, 15)
+                    } else {
+                        let dx = (x == CHUNK_SIZE) as i32 - (x == -1) as i32;
+                        let dy = (y == CHUNK_SIZE) as i32 - (y == -1) as i32;
+                        let dz = (z == CHUNK_SIZE) as i32 - (z == -1) as i32;
+                        let local = IVec3::new(
+                            if dx == -1 {
+                                CHUNK_SIZE - 1
+                            } else {
+                                x & (CHUNK_SIZE - 1)
+                            },
+                            if dy == -1 {
+                                CHUNK_SIZE - 1
+                            } else {
+                                y & (CHUNK_SIZE - 1)
+                            },
+                            if dz == -1 {
+                                CHUNK_SIZE - 1
+                            } else {
+                                z & (CHUNK_SIZE - 1)
+                            },
+                        )
+                        .as_uvec3();
+                        chunks[(dy + 1) as usize][(dz + 1) as usize][(dx + 1) as usize]
+                            .map_or(pack_light(0, 15), |chunk| chunk.get_light(local))
+                    };
+                    padded.set_light(x, y, z, light);
                 }
             }
         }
@@ -271,17 +285,35 @@ impl World {
         }
 
         for cp in removed {
-            for axis in 0..3 {
-                for sign in [-1, 1] {
-                    let mut neighbor = cp;
-                    match axis {
-                        0 => neighbor.x += sign,
-                        1 => neighbor.y += sign,
-                        _ => neighbor.z += sign,
-                    }
-                    if self.chunks.contains_key(&neighbor) {
-                        self.dirty.insert(neighbor);
-                    }
+            self.mark_mesh_neighbors_dirty(cp);
+            for neighbor in [
+                LightColumn {
+                    x: cp.x - 1,
+                    z: cp.z,
+                },
+                LightColumn {
+                    x: cp.x + 1,
+                    z: cp.z,
+                },
+                LightColumn {
+                    x: cp.x,
+                    z: cp.z - 1,
+                },
+                LightColumn {
+                    x: cp.x,
+                    z: cp.z + 1,
+                },
+            ] {
+                self.mark_light_dirty(neighbor);
+            }
+            for neighbor in [
+                IVec3::new(cp.x - 1, cp.y, cp.z),
+                IVec3::new(cp.x + 1, cp.y, cp.z),
+                IVec3::new(cp.x, cp.y, cp.z - 1),
+                IVec3::new(cp.x, cp.y, cp.z + 1),
+            ] {
+                if self.chunks.contains_key(&neighbor) {
+                    self.dirty.insert(neighbor);
                 }
             }
         }
@@ -290,13 +322,68 @@ impl World {
     pub fn take_dirty(&mut self) -> Vec<IVec3> {
         self.dirty.drain().collect()
     }
+
+    fn mark_light_dirty_edit(&mut self, cp: IVec3) {
+        let c = LightColumn { x: cp.x, z: cp.z };
+        self.mark_light_dirty(c);
+        for n in [
+            LightColumn { x: c.x - 1, z: c.z },
+            LightColumn { x: c.x + 1, z: c.z },
+            LightColumn { x: c.x, z: c.z - 1 },
+            LightColumn { x: c.x, z: c.z + 1 },
+        ] {
+            self.mark_light_dirty(n);
+        }
+    }
+
+    fn mark_light_dirty_insert(&mut self, cp: IVec3) {
+        let c = LightColumn { x: cp.x, z: cp.z };
+        self.mark_light_dirty(c);
+        if self.column_loaded(c) {
+            for n in [
+                LightColumn { x: c.x - 1, z: c.z },
+                LightColumn { x: c.x + 1, z: c.z },
+                LightColumn { x: c.x, z: c.z - 1 },
+                LightColumn { x: c.x, z: c.z + 1 },
+            ] {
+                self.mark_light_dirty(n);
+            }
+        }
+    }
+
+    fn mark_mesh_neighbors_dirty(&mut self, cp: IVec3) {
+        for axis in 0..3 {
+            for sign in [-1, 1] {
+                let mut n = cp;
+                match axis {
+                    0 => n.x += sign,
+                    1 => n.y += sign,
+                    _ => n.z += sign,
+                }
+                if self.chunks.contains_key(&n) {
+                    self.dirty.insert(n);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn mark_light_dirty(&mut self, column: LightColumn) {
+        *self.light_epochs.entry(column).or_insert(0) += 1;
+        self.light_dirty.insert(column);
+    }
+
+    pub(crate) fn mark_light_boundary_dirty(&mut self, column: LightColumn) {
+        self.light_dirty.insert(column);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::World;
     use crate::world::block::AIR;
+    use crate::world::chunk::Chunk;
     use crate::world::coords::{CHUNK_SIZE, WORLD_CHUNKS_Y};
+    use crate::world::light::LightColumn;
     use glam::IVec3;
 
     #[test]
@@ -384,5 +471,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn incomplete_column_insert_does_not_dirty_loaded_adjacent_column() {
+        let mut world = World::new(0);
+        for y in 0..WORLD_CHUNKS_Y {
+            world.insert_generated(IVec3::new(1, y, 0), Chunk::new_air());
+        }
+        world.take_light_dirty();
+        for y in 0..WORLD_CHUNKS_Y - 1 {
+            world.insert_generated(IVec3::new(0, y, 0), Chunk::new_air());
+        }
+        let dirty = world.take_light_dirty();
+        assert!(!dirty.contains(&LightColumn { x: 1, z: 0 }));
+        world.insert_generated(IVec3::new(0, WORLD_CHUNKS_Y - 1, 0), Chunk::new_air());
+        assert!(
+            world
+                .take_light_dirty()
+                .contains(&LightColumn { x: 1, z: 0 })
+        );
     }
 }

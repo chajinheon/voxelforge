@@ -2,7 +2,7 @@ use glam::IVec3;
 
 use crate::world::{
     block::{AIR, def},
-    chunk::PaddedChunk,
+    chunk::{PaddedChunk, block_light, sky_light},
     coords::{FACE_NORMALS, face_corners},
 };
 
@@ -65,12 +65,17 @@ fn mesh_chunk_pass(padded: &PaddedChunk, translucent_pass: bool) -> ChunkMesh {
 
                     let corners = face_corners(face, bp);
                     let aos = corners.map(|corner| face_ao(padded, bp, face, corner));
+                    let light = corners.map(|corner| corner_light(padded, bp, face, corner, id));
+                    let block_lights = light.map(|(block, _)| block);
+                    let sky_lights = light.map(|(_, sky)| sky);
                     append_quad_with_lowered(
                         &mut mesh,
                         corners,
                         face,
                         aos,
                         block.textures[face] as u32,
+                        block_lights,
+                        sky_lights,
                         lowered_pattern(
                             id == crate::world::block::WATER
                                 && padded.get(bp.x, bp.y + 1, bp.z) != id,
@@ -110,12 +115,43 @@ pub(crate) fn face_ao(padded: &PaddedChunk, bp: IVec3, face: usize, corner: IVec
     }
 }
 
+/// Average the four light cells in front of a face corner, with integer rounding.
+pub(crate) fn corner_light(
+    padded: &PaddedChunk,
+    bp: IVec3,
+    face: usize,
+    corner: IVec3,
+    current_id: u16,
+) -> (u32, u32) {
+    let (tangent_1, tangent_2) = FACE_TANGENTS[face];
+    let front = bp + FACE_NORMALS[face];
+    let s1 = corner_side(bp, corner, tangent_1);
+    let s2 = corner_side(bp, corner, tangent_2);
+    let samples = [front, front + s1, front + s2, front + s1 + s2];
+    let block = (samples
+        .iter()
+        .map(|p| block_light(padded.get_light(p.x, p.y, p.z)) as u32)
+        .sum::<u32>()
+        + 2)
+        / 4;
+    let sky = (samples
+        .iter()
+        .map(|p| sky_light(padded.get_light(p.x, p.y, p.z)) as u32)
+        .sum::<u32>()
+        + 2)
+        / 4;
+    (block.max(def(current_id).emission as u32), sky)
+}
+
+#[allow(clippy::too_many_arguments)] // Vertex fields mirror the fixed packed layout.
 pub(crate) fn append_quad_with_lowered(
     mesh: &mut ChunkMesh,
     corners: [IVec3; 4],
     face: usize,
     aos: [u32; 4],
     tex: u32,
+    block_lights: [u32; 4],
+    sky_lights: [u32; 4],
     lowered: [bool; 4],
 ) {
     let base = mesh.vertices.len() as u32;
@@ -128,8 +164,8 @@ pub(crate) fn append_quad_with_lowered(
                 face as u32,
                 ao,
                 tex,
-                0,
-                15,
+                block_lights[i],
+                sky_lights[i],
             ),
             lowered[i],
         ));
@@ -161,8 +197,9 @@ mod tests {
     use super::*;
     use crate::mesh::vertex::is_lowered;
     use crate::world::{
-        block::{GLASS, STONE, WATER},
+        block::{GLASS, STONE, TORCH, WATER},
         chunk::PaddedChunk,
+        chunk::pack_light,
     };
 
     fn chunk_with(blocks: &[(i32, i32, i32)]) -> PaddedChunk {
@@ -283,5 +320,33 @@ mod tests {
         assert_eq!(patterns[3], [false; 4]); // -Y
         assert_eq!(patterns[4], [false, false, true, true]); // +Z
         assert_eq!(patterns[5], [false, true, true, false]); // -Z
+    }
+
+    #[test]
+    fn mesher_bakes_corner_light_and_sky() {
+        let mut padded = PaddedChunk::new();
+        padded.set(0, 0, 0, STONE);
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let block = (x + 1 + (z + 1) * 3) as u8;
+                let sky = (12 - x - z) as u8;
+                padded.set_light(x, 1, z, pack_light(block, sky));
+            }
+        }
+        let mesh = mesh_chunk(&padded);
+        let expected = [(2, 13), (5, 12), (6, 11), (3, 12)];
+        for (vertex, expected) in mesh.vertices[8..12].iter().zip(expected) {
+            let unpacked = crate::mesh::vertex::unpack(*vertex);
+            assert_eq!((unpacked.6, unpacked.7), expected);
+        }
+
+        let mut torch = PaddedChunk::new();
+        torch.set(0, 0, 0, TORCH);
+        let torch_mesh = mesh_chunk(&torch);
+        assert!(
+            torch_mesh.vertices[8..12]
+                .iter()
+                .all(|vertex| crate::mesh::vertex::unpack(*vertex).6 == 14)
+        );
     }
 }

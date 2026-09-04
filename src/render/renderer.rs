@@ -10,12 +10,12 @@ use super::shader_watch::ShaderWatcher;
 use super::textures::BlockTextures;
 use super::translucent::TranslucentPipeline;
 
-const SKY: wgpu::Color = wgpu::Color {
-    r: 0.53,
-    g: 0.81,
-    b: 0.92,
-    a: 1.0,
-};
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RenderView {
+    #[default]
+    Final,
+    Light,
+}
 
 /// Owns render resources but accepts views supplied by either a window or an
 /// offscreen target. No `Surface` or `Window` is part of this type.
@@ -149,7 +149,25 @@ impl Renderer {
         globals: &Globals,
         chunks: &[GpuChunkMeshes],
     ) -> usize {
-        self.render_internal(color_view, depth_view, globals, chunks, None)
+        self.render_internal(
+            color_view,
+            depth_view,
+            globals,
+            chunks,
+            None,
+            RenderView::Final,
+        )
+    }
+
+    pub fn render_view(
+        &mut self,
+        color_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        globals: &Globals,
+        chunks: &[GpuChunkMeshes],
+        view: RenderView,
+    ) -> usize {
+        self.render_internal(color_view, depth_view, globals, chunks, None, view)
     }
 
     /// Render an opaque frame and optionally draw the selected block outline.
@@ -161,7 +179,14 @@ impl Renderer {
         chunks: &[GpuChunkMeshes],
         selected_block: Option<glam::IVec3>,
     ) -> usize {
-        self.render_internal(color_view, depth_view, globals, chunks, selected_block)
+        self.render_internal(
+            color_view,
+            depth_view,
+            globals,
+            chunks,
+            selected_block,
+            RenderView::Final,
+        )
     }
 
     fn render_internal(
@@ -171,6 +196,7 @@ impl Renderer {
         globals: &Globals,
         chunks: &[GpuChunkMeshes],
         selected_block: Option<glam::IVec3>,
+        view: RenderView,
     ) -> usize {
         if self.watcher.poll() {
             let _ = self.chunks.reload_shader(&self.device, self.color_format);
@@ -229,7 +255,12 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(SKY),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: globals.sky_color[0] as f64,
+                            g: globals.sky_color[1] as f64,
+                            b: globals.sky_color[2] as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -245,13 +276,101 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.chunks.draw_visible(&mut pass, &opaque, &frustum);
-            if selected_block.is_some() {
-                self.outline.draw(&mut pass);
+            match view {
+                RenderView::Final => {
+                    self.chunks.draw_visible(&mut pass, &opaque, &frustum);
+                    if selected_block.is_some() {
+                        self.outline.draw(&mut pass);
+                    }
+                    self.translucent.draw(&mut pass, &translucent, &frustum);
+                }
+                RenderView::Light => {
+                    self.chunks.draw_visible_light(&mut pass, &opaque, &frustum);
+                    self.translucent
+                        .draw_light(&mut pass, &translucent, &frustum);
+                }
             }
-            self.translucent.draw(&mut pass, &translucent, &frustum);
         }
         self.queue.submit([encoder.finish()]);
         visible_chunks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::{Gpu, OffscreenTarget, day_state};
+    use glam::{Mat4, Vec3};
+
+    #[test]
+    fn shader_hotreload_preserves_final_and_light_pipelines_on_error() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "voxelforge-hotreload-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let shaders = root.join("shaders");
+        std::fs::create_dir_all(&shaders)?;
+        let chunk_path = shaders.join("chunk.wgsl");
+        let outline_path = shaders.join("outline.wgsl");
+        const CHUNK_SHADER: &str = include_str!("../../assets/shaders/chunk.wgsl");
+        const OUTLINE_SHADER: &str = include_str!("../../assets/shaders/outline.wgsl");
+        std::fs::write(&chunk_path, CHUNK_SHADER)?;
+        std::fs::write(&outline_path, OUTLINE_SHADER)?;
+
+        let gpu = Gpu::new()?;
+        let mut renderer = Renderer::with_assets(
+            &gpu.device,
+            &gpu.queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            &root,
+        )?;
+        let mut padded = crate::world::chunk::PaddedChunk::new();
+        padded.set(0, 0, 0, crate::world::block::STONE);
+        let mesh = crate::mesh::mesh_chunk_greedy_all(&padded);
+        let chunks = vec![renderer.upload_chunk_meshes(&mesh, glam::IVec3::ZERO)?];
+        std::fs::write(&chunk_path, "this is not valid wgsl")?;
+        assert!(
+            !renderer
+                .chunks
+                .reload_shader(&gpu.device, wgpu::TextureFormat::Rgba8UnormSrgb)
+        );
+
+        let target = OffscreenTarget::new(&gpu.device, 8, 8)?;
+        let globals = Globals::from_day(Mat4::IDENTITY, Vec3::ZERO, 0.0, 8.0, 8.0, day_state(0.0));
+        renderer.render_view(
+            &target.color_view,
+            &target.depth_view,
+            &globals,
+            &chunks,
+            RenderView::Final,
+        );
+        renderer.render_view(
+            &target.color_view,
+            &target.depth_view,
+            &globals,
+            &chunks,
+            RenderView::Light,
+        );
+        target.read_pixels(&gpu.device, &gpu.queue)?;
+
+        std::fs::write(&chunk_path, CHUNK_SHADER)?;
+        assert!(
+            renderer
+                .chunks
+                .reload_shader(&gpu.device, wgpu::TextureFormat::Rgba8UnormSrgb)
+        );
+        assert!(
+            renderer
+                .translucent
+                .reload_shader(&gpu.device, wgpu::TextureFormat::Rgba8UnormSrgb)
+        );
+        assert!(
+            renderer
+                .outline
+                .reload_shader(&gpu.device, wgpu::TextureFormat::Rgba8UnormSrgb)
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

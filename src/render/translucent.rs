@@ -70,4 +70,13 @@ impl TranslucentPipeline {
     ) -> usize {
         self.pipeline.draw_visible(pass, chunks, frustum)
     }
+
+    pub fn draw_light<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        chunks: &[&'a GpuChunk],
+        frustum: &Frustum,
+    ) -> usize {
+        self.pipeline.draw_visible_light(pass, chunks, frustum)
+    }
 }

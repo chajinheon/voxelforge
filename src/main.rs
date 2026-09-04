@@ -8,7 +8,7 @@ use voxelforge::player::camera::EYE_HEIGHT;
 use voxelforge::player::{
     Body, Camera, Controller, place_rejected_inside_player_aabb, safe_spawn, step,
 };
-use voxelforge::render::{Globals, GpuChunkMeshes, Renderer};
+use voxelforge::render::{Globals, GpuChunkMeshes, Renderer, day_state};
 use voxelforge::stream::Streamer;
 use voxelforge::world::block::{AIR, HOTBAR, WATER, def};
 use voxelforge::world::coords::{WORLD_CHUNKS_Y, chunk_of};
@@ -179,13 +179,14 @@ impl App {
         let (width, height) = gpu
             .map(|gpu| (gpu.config.width, gpu.config.height))
             .unwrap_or((1, 1));
-        Globals::new(
+        let world_time = self.started.elapsed().as_secs_f32();
+        Globals::from_day(
             self.camera.proj(width.max(1) as f32 / height.max(1) as f32) * self.camera.view(),
             self.camera.pos,
-            Vec3::new(-0.4, -1.0, -0.3).normalize(),
-            self.started.elapsed().as_secs_f32(),
+            world_time,
             width as f32,
             height as f32,
+            day_state(world_time),
         )
     }
 
