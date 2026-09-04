@@ -1,69 +1,52 @@
-//! voxelforge — M0 smoke test.
-//!
-//! Opens a window, creates a wgpu (Metal) device, clears to sky blue every frame,
-//! and logs the adapter. This file exists to prove the exact wgpu 30 / winit 0.30
-//! API surface compiles and runs on this machine. M1+ replaces it with the real
-//! app loop (see docs/BLUEPRINT.md §2 for the module map).
-//!
-//! Set `VF_SMOKE_FRAMES=3` to exit automatically after 3 rendered frames
-//! (used by the headless verification command in docs/ROADMAP.md).
+//! Windowed Voxelforge entrypoint for the M1 static-terrain milestone.
 
 use std::sync::Arc;
 
+use glam::{IVec3, Mat4, Vec3};
+use voxelforge::mesh::mesh_chunk;
+use voxelforge::render::{Globals, Gpu, GpuChunk, Renderer};
+use voxelforge::world::coords::WORLD_CHUNKS_Y;
+use voxelforge::world::r#gen::WorldGen;
+use voxelforge::world::world::World;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-const SKY: wgpu::Color = wgpu::Color {
-    r: 0.53,
-    g: 0.81,
-    b: 0.92,
-    a: 1.0,
-};
+const WINDOW_WIDTH: f64 = 1280.0;
+const WINDOW_HEIGHT: f64 = 720.0;
+const TERRAIN_RADIUS: i32 = 4;
+const DEFAULT_SEED: u64 = 1;
+const DEFAULT_YAW: f32 = 0.6;
+const DEFAULT_PITCH: f32 = -0.3;
+const FOV_Y: f32 = 60.0_f32.to_radians();
+const NEAR: f32 = 0.05;
+const FAR: f32 = 1000.0;
 
-struct Gpu {
+struct WindowGpu {
+    window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    window: Arc<Window>,
+    depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    renderer: Renderer,
+    chunks: Vec<GpuChunk>,
+    globals: Globals,
 }
 
-impl Gpu {
+impl WindowGpu {
     fn new(window: Arc<Window>) -> anyhow::Result<Self> {
-        // wgpu 30: `Instance::default()` == `Instance::new(InstanceDescriptor::new_without_display_handle())`.
-        let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window.clone())?;
-
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))?;
-        let info = adapter.get_info();
-        log::info!(
-            "adapter: {} | backend: {:?} | driver: {} {}",
-            info.name,
-            info.backend,
-            info.driver,
-            info.driver_info
-        );
-
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("voxelforge-device"),
-                ..Default::default()
-            }))?;
-
+        let gpu = Gpu::new()?;
+        let surface = gpu.instance.create_surface(window.clone())?;
         let size = window.inner_size();
         let mut config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
             .ok_or_else(|| anyhow::anyhow!("surface is not supported by adapter"))?;
         config.present_mode = wgpu::PresentMode::AutoVsync;
-        surface.configure(&device, &config);
+        surface.configure(&gpu.device, &config);
+
         log::info!(
             "surface: {:?} {}x{} (scale {})",
             config.format,
@@ -72,12 +55,29 @@ impl Gpu {
             window.scale_factor()
         );
 
+        let (depth, depth_view) = create_depth(&gpu.device, config.width, config.height);
+        let mut renderer = Renderer::new(&gpu.device, &gpu.queue, config.format)?;
+        let (chunks, globals) = build_terrain(
+            &mut renderer,
+            DEFAULT_SEED,
+            TERRAIN_RADIUS,
+            config.width,
+            config.height,
+        )?;
+
+        // Keep the device and queue owned by this state. The surface remains
+        // valid because the Arc<Window> is retained alongside it.
         Ok(Self {
-            surface,
-            device,
-            queue,
-            config,
             window,
+            surface,
+            device: gpu.device,
+            queue: gpu.queue,
+            config,
+            depth,
+            depth_view,
+            renderer,
+            chunks,
+            globals,
         })
     }
 
@@ -88,13 +88,16 @@ impl Gpu {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        (self.depth, self.depth_view) = create_depth(&self.device, width, height);
+        self.globals = make_globals(DEFAULT_SEED, DEFAULT_YAW, DEFAULT_PITCH, width, height);
     }
 
-    /// Returns true when a frame was actually presented.
+    /// Acquire and present one frame. `false` means that no frame was
+    /// presented (for example while the window is occluded or outdated).
     fn render(&mut self) -> bool {
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 return false;
             }
@@ -110,41 +113,95 @@ impl Gpu {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frame"),
-            });
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(SKY),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-        self.queue.submit([encoder.finish()]);
+        self.renderer
+            .render(&view, &self.depth_view, &self.globals, &self.chunks);
         self.window.pre_present_notify();
-        // wgpu 30: presenting moved from `SurfaceTexture::present` to `Queue::present`.
         self.queue.present(frame);
         true
     }
 }
 
+fn create_depth(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("window-depth"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+    (depth, view)
+}
+
+fn build_terrain(
+    renderer: &mut Renderer,
+    seed: u64,
+    radius: i32,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<(Vec<GpuChunk>, Globals)> {
+    let mut world = World::new(seed);
+    for z in -radius..=radius {
+        for x in -radius..=radius {
+            for y in 0..WORLD_CHUNKS_Y {
+                world.ensure_loaded(IVec3::new(x, y, z));
+            }
+        }
+    }
+
+    let mut dirty = world.take_dirty();
+    dirty.sort_by_key(|cp| cp.x * cp.x + cp.z * cp.z + cp.y * cp.y);
+    let mut gpu_chunks = Vec::with_capacity(dirty.len());
+    for cp in dirty {
+        let mesh = mesh_chunk(&world.padded(cp));
+        if !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
+            gpu_chunks.push(renderer.upload_chunk(&mesh, cp * 32)?);
+        }
+    }
+    let globals = make_globals(seed, DEFAULT_YAW, DEFAULT_PITCH, width, height);
+    Ok((gpu_chunks, globals))
+}
+
+#[allow(deprecated)] // BLUEPRINT D4 fixes these exact glam constructors.
+fn make_globals(seed: u64, yaw: f32, pitch: f32, width: u32, height: u32) -> Globals {
+    let generator = WorldGen::new(seed);
+    let eye_y = generator.height_at(0, 0) as f32 + 3.0;
+    let position = Vec3::new(0.0, eye_y, 0.0);
+    let view = Mat4::look_to_rh(position, forward(yaw, pitch), Vec3::Y);
+    let projection =
+        Mat4::perspective_rh(FOV_Y, width.max(1) as f32 / height.max(1) as f32, NEAR, FAR);
+    Globals::new(
+        projection * view,
+        position,
+        Vec3::new(-0.4, -1.0, -0.3).normalize(),
+        0.0,
+        width as f32,
+        height as f32,
+    )
+}
+
+fn forward(yaw: f32, pitch: f32) -> Vec3 {
+    Vec3::new(
+        yaw.sin() * pitch.cos(),
+        pitch.sin(),
+        -yaw.cos() * pitch.cos(),
+    )
+}
+
 #[derive(Default)]
 struct App {
-    gpu: Option<Gpu>,
+    gpu: Option<WindowGpu>,
     frames: u32,
     smoke_frames: Option<u32>,
 }
@@ -154,11 +211,24 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title("voxelforge — M0 smoke")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
-        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        self.gpu = Some(Gpu::new(window).expect("init gpu"));
+        let attributes = Window::default_attributes()
+            .with_title("voxelforge — M1 terrain")
+            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                log::error!("create window failed: {error}");
+                event_loop.exit();
+                return;
+            }
+        };
+        match WindowGpu::new(window) {
+            Ok(gpu) => self.gpu = Some(gpu),
+            Err(error) => {
+                log::error!("initialize renderer failed: {error:#}");
+                event_loop.exit();
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -167,20 +237,11 @@ impl ApplicationHandler for App {
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } => event_loop.exit(),
             WindowEvent::Resized(size) => gpu.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 if gpu.render() {
-                    self.frames += 1;
-                    if self.smoke_frames.is_some_and(|n| self.frames >= n) {
+                    self.frames = self.frames.saturating_add(1);
+                    if self.smoke_frames.is_some_and(|limit| self.frames >= limit) {
                         log::info!("smoke: rendered {} frames, exiting", self.frames);
                         event_loop.exit();
                         return;
@@ -189,6 +250,12 @@ impl ApplicationHandler for App {
                 gpu.window.request_redraw();
             }
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(gpu) = self.gpu.as_ref() {
+            gpu.window.request_redraw();
         }
     }
 }
@@ -201,8 +268,8 @@ fn main() -> anyhow::Result<()> {
 
     let smoke_frames = std::env::var("VF_SMOKE_FRAMES")
         .ok()
-        .and_then(|v| v.parse::<u32>().ok());
-
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0);
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
