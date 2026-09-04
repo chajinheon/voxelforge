@@ -13,6 +13,14 @@
 
 ---
 
+## 2026-09-04 13:55  M3 종료 · M4/M5 설계 — Claude
+
+- 한 것: 진헌 손 플레이 통과(13:37) → **M3 종료**. M3.1은 GPT가 아직 시작하지 않았으므로 M4의 0단계로 흡수. BLUEPRINT **§14**(M4·M5 상세 설계) 추가: 워커 스레드 스트리밍(rayon + mpsc, 편집은 메인 동기), greedy(키 = tex+ao×4, 대각 뒤집기), 물리(Body/MoveInput, 1/120 substep, Y→X→Z 스윕), 나무(순수 `tree_at`/`tree_blocks`, 이웃 범위 ±2 열 스캔으로 경계 이어짐)·동굴(3D 노이즈 > 0.62, 8 ≤ y ≤ h−6), 프러스텀 컬링, 저장(수정 청크만 lz4 + world.json), 투명 패스(`translucent` 플래그, 같은 id 컬링, 물 윗면 비트 23, cull None, 뒤→앞), 아레나(조건부). ROADMAP M4(M4.0~M4.5)·M5(M5.1~M5.3) 재작성, 테스트 이름 20개, 검증 명령 포함.
+- 검증: 없음(문서만). 저장소 상태 `c2db9e7` 기준, 작업 트리 깨끗.
+- 설계와 다르게 한 것 / 제안: `DEFAULT_SLOTS` 성장 로직 대신 16384 고정(4MB). 반경 기본 10·검증 12·`VF_RADIUS`. 아레나는 M4 측정에 따라 조건부.
+- 열린 문제: GPT가 M4~M5를 한 번에 진행. M4 끝에서 멈추지 않고 M5까지 가되, 마일스톤·단계마다 커밋과 LOG.
+- 다음: GPT → M4.0 … M5.3 → 멈춤 → Claude 리뷰 → M6.
+
 ## 2026-09-04 13:40  M3 리뷰 — Claude
 
 - 한 것: 리뷰 체크리스트 5항목 수행. 검증 명령 전부 재실행(테스트 25 passed, clippy `-D warnings` 통과, fmt 통과, 스냅샷 `/tmp/rv_m3_default.png` 190청크). 계약 대조: `vertex.rs` 비트 레이아웃, `coords.rs` 면 코너 표 6개, `chunk.wgsl` 디코드·UV·음영, `gen.rs` 층 규칙, `raycast.rs` DDA·법선, `world.rs` dirty 전파, `chunk_pipeline.rs` dynamic offset·에러 스코프, `window_gpu.rs` `CurrentSurfaceTexture` 7변형 — 전부 일치. 렌더 루프에 `unwrap`/`expect` 없음(테스트 제외).

@@ -75,6 +75,8 @@ voxelforge/
 
 원칙: `render::Renderer`는 `wgpu::Device/Queue`와 "색 뷰 + 깊이 뷰"만 받는다. 창(`Surface`)은 `main.rs`가, 오프스크린 텍스처는 `snapshot.rs`가 만든다. 같은 Renderer를 둘이 공유한다.
 
+M3에서 실제로 추가된 것: `src/window_gpu.rs`(창 서피스 보조, main.rs 500줄 규칙), `src/player/interaction.rs`(AABB 겹침 판정). M4·M5에서 추가되는 모듈은 **§14.1**.
+
 ## 3. 좌표·청크 규약
 
 - 블록 위치 `IVec3 (x,y,z)`. 블록은 `[x,x+1)×[y,y+1)×[z,z+1)`를 차지한다.
@@ -347,9 +349,149 @@ winit 0.30: `ApplicationHandler` 트레이트(`resumed`, `window_event`, `device
 - 저장 포맷(M5) → 수정된 청크만 `saves/<name>/c_<x>_<y>_<z>.bin`(lz4) + `world.json{seed}`. 리전 파일은 필요해질 때
 - 엔진 크레이트(bevy) → 사용 안 함
 - Retina 렌더 스케일 → M7까지 물리 해상도 그대로
-- 스트리밍 예산 → **시간 예산(≤10ms/프레임)**, 개수 예산 아님 (§5). 빈 청크는 메싱 생략
-- 청크 유니폼 아레나 슬롯(현재 4096 고정) → M4에서 R=12면 25×25×8=5000 청크라 부족. 반경에서 계산하거나 부족 시 재할당
+- 스트리밍 예산 → **시간 예산**, 개수 예산 아님 (§5). 빈 청크는 메싱 생략. M4부터는 워커 스레드 구조(§14.2)가 이를 대체
+- 청크 유니폼 아레나 슬롯 → **16384 고정**(4MB, R=16까지 충분). 성장 로직 없음
+- M4·M5의 추가 선결정은 **§14.11**
 
 ## 13. 이후 티어 요약 (상세는 ROADMAP)
 
 M4 greedy·스레드·물리 → M5 저장·투명·아레나 → M6 플러드필 조명·낮밤·바람 → M7 오프스크린 HDR·CSM 그림자·SSAO·대기 하늘·ACES/블룸·렌더 스케일 → M8 물(파도·SSR·굴절)·볼류메트릭·구름·LOD → M9 복셀 GI(3D 텍스처 clipmap + 컴퓨트 DDA + 시간적 누적).
+
+---
+
+## 14. M4·M5 상세 설계 (2026-09-04 13:50 확정, Claude)
+
+M3 손 플레이 통과(13:37). M3.1 잔여 항목은 M4의 0단계다. 아래 계약은 §4·§5를 **확장**한다(기존 이름은 유지).
+
+### 14.1 새 모듈
+
+```
+src/stream.rs                 # Streamer: 원하는 집합, 잡 발행(rayon), 결과 회수(mpsc), 시간 예산, settled 로그   (M4)
+src/mesh/greedy.rs            # mesh_chunk_greedy: 키(tex, ao[4]) 동일 셀 병합. 면/AO 헬퍼는 mesher.rs와 공유         (M4)
+src/player/physics.rs         # Body, MoveInput, step(), sweep_axis()                                            (M4)
+src/render/frustum.rs         # Frustum::from_view_proj, intersects_aabb                                          (M4)
+src/world/trees.rs            # tree_at, tree_blocks (순수 함수, gen.rs가 호출)                                    (M4)
+src/world/save.rs             # SaveDir: world.json, 청크 파일 lz4 읽기/쓰기                                       (M5)
+src/render/translucent.rs     # 투명 파이프라인(블렌드, 깊이 쓰기 off, cull None)                                  (M5)
+src/render/mesh_arena.rs      # 큰 VB/IB + 프리리스트 (M5, 조건부 — 14.9)                                          (M5)
+```
+
+`main.rs`는 이미 497줄이다. M4에서 스트리밍은 `stream.rs`, 이동은 `physics.rs`로 빠져야 500줄 규칙을 지킨다.
+
+### 14.2 스트리밍 — 워커 스레드 (M4)
+
+- 풀: **rayon** `ThreadPoolBuilder::num_threads(w)`, `w = available_parallelism().saturating_sub(2).clamp(2, 8)`. 결과는 `std::sync::mpsc::channel`. (분기 선결정: crossbeam·수제 풀 아님)
+- 잡 두 종류. `Gen { cp, gen: Arc<WorldGen> } → Chunk`, `Mesh { cp, padded: Box<PaddedChunk>, version: u64 } → ChunkMesh`. `WorldGen: Send + Sync`(FastNoiseLite는 숫자 필드뿐)를 `static_assertions` 없이 `fn assert_send_sync<T: Send + Sync>()` 테스트로 고정.
+- `padded()`는 메인 스레드(월드 읽기), 메싱·생성은 워커. 메인은 결과를 받아 업로드만.
+- 프레임 순서: ① 결과 채널 전부 회수(gen → `World::insert_generated`, mesh → `version` 일치할 때만 업로드, 불일치·언로드면 폐기) ② 원하는 집합과 비교해 새 잡 발행(가까운 순, 종류별 in-flight ≤ `2w`) ③ 언로드 ④ 편집으로 dirty된 청크(urgent)는 **메인 스레드에서 동기 메싱**(같은 프레임 반영, 프레임당 ≤ 3개, 넘치면 다음 프레임).
+- 메인 스레드 예산: `padded()` 복사 + 업로드 합산 ≤ 6ms/프레임(`Instant`). 개수 상한 없음.
+- 부트스트랩: 첫 프레임 전 스폰 반경 1(3×3×8)은 동기 생성·메싱(플레이어가 떨어지지 않게).
+- `stream: settled in {:.2}s ({} chunks, {} drawn)`: 원하는 집합 전부 로딩 + in-flight 0 + 큐 0인 첫 순간 1회. **목표 R=12에서 < 3.0s**(예상 1~1.5s).
+- 반경: `STREAM_RADIUS` 기본 **10**, 환경변수 `VF_RADIUS`(4..=16). 성능 검증은 12.
+- `World` 추가 계약:
+
+```rust
+impl World {
+    pub fn is_loaded(&self, cp: IVec3) -> bool;
+    pub fn insert_generated(&mut self, cp: IVec3, chunk: Chunk);   // ensure_loaded의 삽입 절반. dirty + 6이웃 dirty
+    pub fn chunk_version(&self, cp: IVec3) -> Option<u64>;         // 삽입 시 1, set_block마다 +1
+    pub fn generator(&self) -> &Arc<WorldGen>;
+}
+```
+
+### 14.3 Greedy 메싱 (M4)
+
+- 면 6개 × 법선축 층 32개 × 32×32 격자. 셀이 보이면(현재 culled 규칙) 키 `key = tex << 8 | ao0<<6 | ao1<<4 | ao2<<2 | ao3`. 같은 키의 인접 셀을 u 방향으로 늘리고, 그 행 전체가 같으면 v 방향으로 늘린다(Lysenko 방식). 비트 평면 최적화는 하지 않는다(필요해지면 M7 이후).
+- 정점은 기존 `pack()`. 쿼드 4정점 위치는 병합 사각형의 코너(§3 코너 순서 유지). UV는 셰이더가 로컬 좌표로 계산하므로 변경 없음(D5).
+- 대각 뒤집기: `ao0 + ao2 > ao1 + ao3`면 인덱스 `(1,2,3),(1,3,0)`. culled 메셔에도 같이 적용해 둘의 픽셀 결과가 같게 한다.
+- `mesh_chunk`(culled)는 남긴다 — 테스트와 `snapshot --mesher culled` 비교 기준. 게임과 스냅샷 기본은 greedy.
+- 계약:
+
+```rust
+// mesh/greedy.rs
+pub fn mesh_chunk_greedy(p: &PaddedChunk) -> ChunkMesh;
+// 테스트: greedy_quad_area_equals_culled_face_count (병합 사각형 넓이 합 == culled 면 수, 랜덤 시드 3개)
+//        greedy_never_merges_different_keys, greedy_flat_slab_top_is_one_quad (32×32 평판 윗면 = 4정점)
+```
+
+### 14.4 물리 (M4)
+
+- `Body { pos: Vec3 /* 발 중심 */, vel: Vec3, on_ground: bool, fly: bool, in_water: bool }`. 카메라 `pos = body.pos + (0, EYE_HEIGHT, 0)`. AABB = `pos ± (0.3, 0, 0.3)`, 높이 1.8 (§4 상수 재사용).
+- `MoveInput { wish: Vec3 /* yaw 기준 수평, 정규화 */, jump: bool, sprint: bool, up: bool, down: bool }`. `Controller`는 이제 카메라를 직접 움직이지 않고 `MoveInput`을 만든다(시선 회전은 그대로 카메라에).
+- 상수: 중력 −28, 종단 −78, 점프 초속 8.5(높이 ≈1.29), 걷기 4.3, 스프린트 5.6, 비행 12(스프린트 ×3). 수중: 중력 ×0.4, 수직 속도 클램프 ±4, Space는 +4 상승, 수평 ×0.6.
+- `step(world, body, input, dt)`: `steps = ceil(dt / (1/120)).clamp(1, 8)`, `h = dt/steps`, 각 substep에서 **Y → X → Z** 순 축별 스윕. 축에서 막히면 그 축 속도 0, Y 하강 중 막힘이면 `on_ground = true`.
+- `sweep_axis(world, min, max, delta, axis) -> (moved, hit)`: 이동 범위를 덮는 블록들 중 `def(id).solid`이고 다른 두 축이 겹치는(ε=1e-4) 블록으로 허용 거리를 줄인다. 계단 자동 오르기 없음.
+- 플레이어 청크가 미로딩이면 물리를 멈춘다(떨어지지 않음). 스폰 열이 물이면 나선형으로 64블록까지 `h > SEA_LEVEL` 열을 찾는다.
+- 키: `F` 비행 토글(켤 때 `vel.y = 0`), Space 점프/상승, LShift 하강(비행), LCtrl 스프린트.
+- 테스트: `physics_falls_and_lands_on_ground`(2초 후 on_ground, `pos.y == 윗면` ±1e-3), `physics_jump_height_about_1_25`(최고점 1.1~1.4), `physics_wall_blocks_horizontal_motion`(벽면에서 정확히 멈춤, 침투 0), `physics_no_tunneling_at_low_fps`(dt 0.25, 속도 40에서도 착지), `physics_fly_ignores_gravity`.
+
+### 14.5 월드젠 — 나무·동굴 (M4)
+
+- **나무**(`world/trees.rs`, 순수): `tree_at(seed, x, z, h) -> Option<Tree>`: `hash01(seed, x, z, TREE_SALT) < 0.004 && h > SEA_LEVEL + 1`. `trunk_h ∈ 4..=6`(같은 해시), `base_y = h + 1`. 블록:
+  - 줄기: `(x, base_y + i, z) LOG`, `i ∈ 0..trunk_h`
+  - 잎: `dy ∈ {trunk_h-2, trunk_h-1}`: `dx,dz ∈ [-2,2]`에서 네 모서리(|dx|=|dz|=2) 제외 → 21셀. `dy = trunk_h`: 3×3. `dy = trunk_h+1`: 십자 5셀.
+  - 규칙: LOG가 LEAVES를 이긴다. 둘 다 지형이 AIR인 곳에만 놓는다.
+- `generate(cp)`는 `x ∈ [cx·32−2, cx·32+34)`, `z` 같은 범위의 열마다 `tree_at`을 보고, **이 청크 안에 떨어지는 블록만** 쓴다. 이웃 청크가 같은 나무를 같은 자리에서 계산하므로 경계에서 이어진다(순수 함수라 스레드 안전).
+- **동굴**: 3D OpenSimplex2(프랙털 없음), 주파수 0.045, 시드 `seed+1`. `noise > 0.62 && 8 <= y <= h - 6`이면 AIR. 표면(h..h-5)은 절대 뚫지 않는다.
+- 테스트: `trees_agree_across_chunk_borders`(시드 고정, 경계를 걸치는 나무를 찾아 두 청크의 블록이 `tree_blocks` 집합과 일치), `caves_do_not_break_surface`(모든 열에서 y=h..h-5가 non-air), 기존 `gen_layers_match_height` 유지.
+
+### 14.6 프러스텀 컬링 (M4)
+
+`Frustum::from_view_proj(Mat4)` → 6평면(Gribb-Hartmann). 청크 AABB `origin .. origin+32` 판정. 컬링된 청크는 draw 안 함. 제목 `drawn`은 컬링 후 수. 테스트 `frustum_culls_chunk_behind_camera`, `frustum_keeps_chunk_in_front`.
+
+### 14.7 M3.1 잔여 (M4 0단계)
+
+`snapshot --edits "set x,y,z,id; …"`, `snapshot --mesher culled|greedy`(기본 greedy), `chunk.wgsl` 더미 연산 제거, `gen.rs` `let _ = self.seed`·`Chunk` 내부 직접 쓰기 정리, `origin / CHUNK_SIZE → chunk_of`, `DEFAULT_SLOTS = 16384`(4MB, R=16까지 충분 — 성장 로직 대신 상한).
+
+### 14.8 저장·불러오기 (M5)
+
+- 위치 `saves/<name>/` (기본 `default`, `VF_SAVE` 또는 `--save`). `.gitignore`에 이미 있음.
+- `world.json` (serde + serde_json): `{ "version": 1, "seed": u64, "player": { "pos": [f32;3], "yaw": f32, "pitch": f32, "fly": bool } }`.
+- 청크 파일 `chunks/c_{x}_{y}_{z}.bin`: 매직 `b"VFC1"` + `lz4_flex::compress_prepend_size(blocks as LE u16 bytes)`. **수정된 청크만** 쓴다.
+- `World`: `modified: HashSet<IVec3>`(set_block 시 삽입), `saved_version: HashMap<IVec3, u64>`. 저장 대상 = modified ∧ `version != saved_version`. 언로드 직전·30초마다·종료 시(CloseRequested, ESC 종료) 저장. 로딩 시 파일이 있으면 생성 대신 읽고 `modified`에 넣는다(스레드 잡 `Gen`은 파일 존재를 메인에서 먼저 검사해 `Load`로 분기).
+- 계약:
+
+```rust
+// world/save.rs
+pub struct SaveDir { root: PathBuf }
+impl SaveDir {
+    pub fn open(name: &str) -> anyhow::Result<Self>;                 // 디렉터리 생성
+    pub fn chunk_path(&self, cp: IVec3) -> PathBuf;
+    pub fn write_chunk(&self, cp: IVec3, chunk: &Chunk) -> anyhow::Result<()>;
+    pub fn read_chunk(&self, cp: IVec3) -> anyhow::Result<Option<Chunk>>;  // 없으면 None, 손상이면 Err(로그 후 재생성)
+    pub fn write_meta(&self, meta: &WorldMeta) -> anyhow::Result<()>;
+    pub fn read_meta(&self) -> anyhow::Result<Option<WorldMeta>>;
+}
+// 테스트: save_roundtrip_chunk_bytes_equal, world_loads_saved_chunk_instead_of_generating,
+//        unmodified_chunks_are_not_written, world_meta_roundtrip
+```
+
+### 14.9 투명 패스 (M5)
+
+- `BlockDef`에 `translucent: bool`(WATER, GLASS) 추가. 메셔는 `ChunkMeshes { opaque: ChunkMesh, translucent: ChunkMesh }`를 내는 `mesh_chunk_all`/`mesh_chunk_greedy_all`을 추가한다(기존 함수는 opaque만 반환, 테스트 유지).
+- 컬링 규칙 확장: 면을 지우는 조건 = 이웃이 opaque **또는 이웃 id가 같고 translucent**(물-물, 유리-유리 사이 면 제거). 잎은 그대로(잎-잎 면 유지).
+- **물 윗면 낮추기**: 정점 `a` 비트 23 = `lowered`(셰이더에서 y −0.125). 물 블록 위가 물이 아니면 +Y 면 4정점과 옆면의 위쪽 2정점에 세운다. 정수 좌표 정점 포맷을 바꾸지 않기 위한 결정.
+- 파이프라인(`render/translucent.rs`): 같은 `chunk.wgsl`(프래그먼트가 텍스처 알파를 내보냄), `blend: ALPHA_BLENDING`, `depth_write_enabled: false`, `depth_compare: Less`, `cull_mode: None`. 절차적 텍스처 알파: water 150, glass 90, 나머지 255.
+- 순서: 불투명 → outline → 투명. 투명 청크는 카메라와 청크 중심 거리로 **뒤→앞** 정렬(프레임마다, 청크 단위).
+- 수중 틴트(선택): 카메라 위치 블록이 WATER면 `time_res.w = 1.0` → 프래그먼트에서 `mix(color, vec3(0.1,0.3,0.6), 0.45)`.
+- 테스트: `mesher_splits_translucent_blocks`, `mesher_culls_faces_between_same_translucent_blocks`, `water_top_face_sets_lowered_flag`.
+- 스냅샷: 해안선 위에서 물 아래 모래가 비친다. `--edits`로 유리창을 세우면 뒤가 보인다.
+
+### 14.10 메시 아레나 (M5, 조건부)
+
+M4 끝의 측정에서 R=12 비행 60초 동안 `max`가 20ms를 넘고 그 원인이 청크 업로드(버퍼 생성/해제)일 때만 구현한다. 아니면 M7로 미룬다(LOG에 측정값 기록).
+구현 시: 정점 96MB + 인덱스 72MB 버퍼 하나씩, 오프셋 정렬 프리리스트(인접 병합), `draw_indexed(range, base_vertex, 0..1)`로 인덱스는 청크 로컬 유지. 가득 차면 그 청크만 전용 버퍼로 폴백하고 1회 경고. 테스트 `arena_alloc_free_coalesces`, `arena_full_falls_back`.
+
+### 14.11 M4·M5 분기 선결정 (묻지 말고 이렇게)
+
+- 스레드 풀 → rayon + std mpsc. 편집 청크는 메인에서 동기 메싱
+- greedy 키 → `(tex, ao×4)` 정확 일치. 라이트(M6)는 그때 키에 추가
+- 물 윗면 → 비트 23 플래그(정점 포맷 유지)
+- 투명 컬 → `cull_mode: None`, 청크 단위 뒤→앞 정렬만
+- 저장 → 수정 청크만, lz4, world.json에 플레이어. 리전 파일 없음
+- 슬롯 → 16384 고정
+- 반경 → 기본 10, 검증 12, `VF_RADIUS`
+- 물리 → 고정 1/120 substep, Y→X→Z, 계단 오르기 없음
+- 잎 → solid, opaque=false 유지(잎-잎 면 유지). 알파 컷아웃 텍스처는 M7 텍스처 작업 때
+- 아레나 → 조건부(14.10)
+- M5가 끝나면 **멈춘다**. Claude 리뷰 → M6

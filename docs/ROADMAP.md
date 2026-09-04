@@ -47,7 +47,7 @@ cargo run --release                                # 진헌/Claude 플레이 확
 cargo run --release --bin snapshot -- --pos 100,90,-60 --yaw 2.4 --pitch -0.35 --out /tmp/vf_m2.png
 ```
 
-## M3 — 건축 (≈1~2h) ← **오늘의 목표** (기능 완료 2026-09-04 13:04, 리뷰 통과 조건부 — M3.1 참조)
+## M3 — 건축 (≈1~2h) — **완료** (기능 13:04 GPT, 리뷰 13:40 Claude, 손 플레이 13:37 진헌 통과)
 
 **만드는 것**: `world/raycast.rs`(DDA), `render/outline.rs` + `outline.wgsl`, LMB 부수기 / RMB 놓기, `HOTBAR` 1~9 + 휠, 플레이어 AABB 겹침 거절, 편집 시 청크 + 경계 이웃 재메싱.
 
@@ -67,9 +67,9 @@ cargo run --release                                # 실제로 짓는다
 
 **M3가 끝나면 멈추고 LOG에 기록 → Claude 리뷰.** 리뷰 전엔 M4로 가지 않는다.
 
-## M3.1 — 리뷰 수정 (≈1h, GPT) ← **현재 위치**
+## M3.1 — 리뷰 수정 → **M4의 0단계로 흡수** (2026-09-04 13:50)
 
-2026-09-04 Claude 리뷰 결과. AO 결함은 Claude가 직접 고쳐 커밋했다(`d4d7e27`). 아래는 GPT 몫.
+2026-09-04 Claude 리뷰 결과. AO 결함은 Claude가 직접 고쳐 커밋했다(`d4d7e27`). 아래 5개는 M4를 시작할 때 먼저 처리한다(별도 커밋 `M4.0: review fixes`). 1번의 「시간 예산」은 M4의 워커 스레드 스트리밍(BLUEPRINT §14.2)으로 대체된다 — 개수 예산만 없애면 된다.
 
 **만드는 것**
 1. 스트리밍 예산을 개수(4/8)에서 **시간 예산 ≤10ms/프레임**으로 교체(BLUEPRINT §5). 첫 프레임 전 스폰 반경 1 동기 로딩·메싱. `is_empty()` 청크 메싱 생략. `stream: settled in X.XXs (N chunks)` 로그 1회.
@@ -78,27 +78,76 @@ cargo run --release                                # 실제로 짓는다
 4. `gen.rs`: `let _ = self.seed;` 제거(필드를 쓰거나 지운다), `chunk.blocks[..] = id; chunk.non_air += 1` 직접 쓰기 대신 `Chunk::set` 또는 전용 생성자 사용.
 5. `main.rs` `remove_unloaded_gpu_chunks`: `origin / CHUNK_SIZE` → `chunk_of(origin)`(지금은 32의 배수라 우연히 맞음).
 
-**완료 조건**
-- `VF_SMOKE_FRAMES=600 cargo run --release` 로그에 `stream: settled in` **< 3.00s**, 로딩 중 프레임 최대 < 33ms(제목·F3 통계).
-- `cargo run --release --bin snapshot -- --seed 1 --radius 3 --pos 0,74,8 --yaw 3.1416 --pitch -0.35 --edits "set 0,70,0,8; set 0,71,0,8; set 0,72,0,8; set 1,70,0,9; set -1,70,0,10; set 0,69,1,0" --out /tmp/vf_m31_edits.png` → 판자 기둥 3개·유리·벽돌·구멍이 PNG에 보인다.
-- `cargo test` 26 passed, clippy `-D warnings` 0, `cargo fmt --check` 통과.
-- LOG 기록 후 커밋 `M3.1: review fixes`. 그 다음 **진헌의 손 플레이**(5×5 벽 + 유리창 + 나무 지붕) → 통과하면 M4.
+**완료 조건**: M4의 완료 조건에 통합했다(아래). 손 플레이는 13:37에 이미 통과.
 
 ---
 
-## M4 — 성능·물리 (Day 2)
+## M4 — 성능·물리 (≈3~4h) ← **현재 위치**
 
-- greedy 메싱(비트마스크 열 기반). culled와 스냅샷 픽셀 동일, 정점 수 ≤ 50%.
-- 워커 스레드: `padded()`는 메인, `mesh_chunk`/`generate`는 워커(rayon 또는 std::thread + crossbeam-channel). 메인은 업로드만.
-- 걷기 물리: 중력 −28 blk/s², 점프 초속 8.5, 축별 AABB 스윕, 계단 자동 오르기 없음. `F`로 비행 토글.
-- 월드젠 나무(LOG+LEAVES), 간단 동굴(3D 노이즈 임계).
-- 검증: `cargo test`(greedy 테스트 추가), 스냅샷 diff, R=12에서 60fps.
+설계는 BLUEPRINT §14.1~14.7. 순서대로, 각 단계마다 커밋.
 
-## M5 — 저장·투명·아레나 (Day 2~3)
+**M4.0 리뷰 잔여** (§14.7): `snapshot --edits`, `--mesher culled|greedy`, wgsl 더미 제거, gen.rs 정리, `chunk_of`, `DEFAULT_SLOTS=16384`. 커밋 `M4.0: review fixes`.
 
-- 저장: 수정 청크만 `saves/<name>/c_x_y_z.bin`(lz4_flex) + `world.json`. 종료 시·30초마다 자동.
-- 투명 패스: WATER/GLASS 별도 메시, 불투명 뒤에 청크 단위 뒤→앞 정렬, 알파 블렌드, 깊이 쓰기 off. 물은 윗면만 살짝 낮게(0.9).
-- 메시 아레나 할당자(큰 VB/IB 하나 + 프리리스트)로 히치 제거.
+**M4.1 워커 스레드 스트리밍** (§14.2): `cargo add rayon`(실버전 LOG에 기록). `src/stream.rs`로 스트리밍 분리, `World::{is_loaded, insert_generated, chunk_version, generator}`, 편집 청크는 메인 동기 메싱, 부트스트랩 반경 1, `stream: settled` 로그, `VF_RADIUS`. 커밋 `M4.1: threaded streaming`.
+
+**M4.2 greedy** (§14.3): `src/mesh/greedy.rs`, 대각 뒤집기(culled에도), 게임·스냅샷 기본 greedy. 커밋 `M4.2: greedy meshing`.
+
+**M4.3 물리** (§14.4): `src/player/physics.rs`, `Controller → MoveInput`, F 비행 토글, 스폰 안전. 커밋 `M4.3: walking physics`.
+
+**M4.4 월드젠** (§14.5): `src/world/trees.rs`, 동굴. 커밋 `M4.4: trees and caves`.
+
+**M4.5 프러스텀 컬링** (§14.6). 커밋 `M4.5: frustum culling`.
+
+**완료 조건**
+- 테스트 추가 통과: `greedy_quad_area_equals_culled_face_count`, `greedy_never_merges_different_keys`, `greedy_flat_slab_top_is_one_quad`, `physics_falls_and_lands_on_ground`, `physics_jump_height_about_1_25`, `physics_wall_blocks_horizontal_motion`, `physics_no_tunneling_at_low_fps`, `physics_fly_ignores_gravity`, `trees_agree_across_chunk_borders`, `caves_do_not_break_surface`, `frustum_culls_chunk_behind_camera`, `frustum_keeps_chunk_in_front`, `worldgen_is_send_sync`. 기존 25 + AO 1 유지 → **≥ 39 passed**.
+- `VF_RADIUS=12 VF_SMOKE_FRAMES=900 cargo run --release` 로그: `stream: settled in X.XXs` **X < 3.0**, 이후 통계 60fps, `max` < 25ms.
+- greedy/culled 스냅샷 비교: 동일 인자로 두 PNG를 뽑아 픽셀 일치율 ≥ 99.5% (아래 명령).
+- greedy 정점 수: 스냅샷 로그에 총 정점 수를 찍고 culled 대비 ≤ 50%.
+- 걷기: 스폰 후 땅에 서고, 점프 1블록 오르기, 벽에 막힘, 물에 들어가면 천천히 가라앉고 Space로 뜸. F로 비행.
+- 나무가 청크 경계에서 잘리지 않는다(스냅샷으로 확인). 동굴 입구가 지표에 없다.
+- `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`.
+
+**검증**
+```bash
+cargo test 2>&1 | tail -3
+VF_RADIUS=12 VF_SMOKE_FRAMES=900 cargo run --release 2>&1 | grep -E "settled|stats" | head -5
+cargo run --release --bin snapshot -- --seed 1 --radius 4 --mesher culled --out /tmp/vf_m4_culled.png
+cargo run --release --bin snapshot -- --seed 1 --radius 4 --mesher greedy --out /tmp/vf_m4_greedy.png
+python3 -c "
+from PIL import Image, ImageChops
+a=Image.open('/tmp/vf_m4_culled.png').convert('RGB'); b=Image.open('/tmp/vf_m4_greedy.png').convert('RGB')
+d=ImageChops.difference(a,b).convert('L'); n=sum(1 for p in d.getdata() if p>4); print('same %.3f%%' % (100*(1-n/(a.width*a.height))))"
+cargo run --release --bin snapshot -- --seed 1 --radius 3 --pos 0,74,8 --yaw 3.1416 --pitch -0.35 --edits "set 0,70,0,8; set 0,71,0,8; set 0,72,0,8; set 1,70,0,9; set -1,70,0,10; set 0,69,1,0" --out /tmp/vf_m4_edits.png
+```
+
+M4가 끝나면 LOG에 기록하고 **멈추지 말고 M5로** 간다.
+
+## M5 — 저장·투명 (≈2~3h)
+
+설계는 BLUEPRINT §14.8~14.10.
+
+**M5.1 저장** (§14.8): `cargo add serde --features derive`, `serde_json`, `lz4_flex`(실버전 LOG). `src/world/save.rs`, `World::{modified, saved_version}`, 언로드·30초·종료 시 저장, 로딩 시 파일 우선. `VF_SAVE`/`--save`. 커밋 `M5.1: save and load`.
+
+**M5.2 투명 패스** (§14.9): `BlockDef.translucent`, `ChunkMeshes`, 같은 id 컬링, 물 윗면 `lowered` 비트, `src/render/translucent.rs`, 뒤→앞 정렬, 텍스처 알파, (선택) 수중 틴트. 커밋 `M5.2: translucent pass`.
+
+**M5.3 아레나** (§14.10, 조건부): M4 측정에서 업로드 히치가 확인될 때만. 아니면 LOG에 「미구현, 측정값 …」.
+
+**완료 조건**
+- 테스트 추가 통과: `save_roundtrip_chunk_bytes_equal`, `world_loads_saved_chunk_instead_of_generating`, `unmodified_chunks_are_not_written`, `world_meta_roundtrip`, `mesher_splits_translucent_blocks`, `mesher_culls_faces_between_same_translucent_blocks`, `water_top_face_sets_lowered_flag` (+ 아레나 시 2개). **≥ 46 passed**.
+- 블록을 놓고 종료 → 재실행 → 그 자리에 있다. `saves/default/chunks/`에 수정 청크 수만큼만 파일이 있다. 플레이어 위치·시선 복원.
+- 물 아래 모래·돌이 비치고, 유리 뒤가 보이고, 물-물·유리-유리 사이 면이 없다. 물 표면이 1/8 낮다.
+- 수중에서 위를 보면 물 표면 뒷면이 보인다(cull None).
+- R=12 비행 60초 `max` < 25ms 유지(투명 패스 추가 후에도).
+
+**검증**
+```bash
+cargo test 2>&1 | tail -3
+cargo run --release --bin snapshot -- --seed 1 --radius 4 --pos 40,66,40 --yaw 2.0 --pitch -0.5 --out /tmp/vf_m5_water.png     # 해안: 물 아래가 비침
+cargo run --release --bin snapshot -- --seed 1 --radius 3 --pos 0,74,8 --yaw 3.1416 --pitch -0.35 --edits "set 0,70,0,9; set 0,71,0,9; set 1,70,0,9; set 1,71,0,9" --out /tmp/vf_m5_glass.png
+VF_SMOKE_FRAMES=120 cargo run --release && ls saves/default/chunks | wc -l    # 편집 없으면 0
+```
+
+**M5가 끝나면 멈춘다.** LOG 기록 → 진헌에게 「M5 완료, 리뷰 요청」 → Claude 리뷰 → M6.
 
 ## M6 — 마크식 조명·낮밤·바람 (Day 3~4)
 
