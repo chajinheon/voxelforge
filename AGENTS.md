@@ -13,7 +13,8 @@
 ## 역할
 
 - **진헌** — 방향 결정, 플레이 테스트, 우선순위. 최종 판단.
-- **Claude (설계·리뷰)** — BLUEPRINT/ROADMAP 소유. 마일스톤 결과를 `cargo test` + 스냅샷 PNG + 코드 읽기로 검수하고 LOG에 리뷰를 남긴다. 설계 변경은 여기서 확정한다.
+- **Claude (설계·리뷰)** — BLUEPRINT/ROADMAP 소유(M0~M5 설계 원본). 마일스톤 결과를 `cargo test` + 스냅샷 PNG + 픽셀 측정 + 코드 읽기로 검수하고 LOG에 리뷰를 남긴다. 설계 변경은 여기서 확정한다. **커밋도 Claude가 리뷰 시점에 한다**(Sol의 실행 정책이 `git commit`을 막음).
+- **GPT Pro (설계 확장, M6~M10)** — 2026-09-04 M5 이후 합류. GitHub의 이 저장소를 읽고 BLUEPRINT §15~§19와 ROADMAP M6~M10, Sol용 KICKOFF를 **§14와 같은 밀도로** 초안한다. 확정 결정(§1 D1~D18, §14.11)을 바꾸려면 「ADR 제안」으로 따로 표시한다. 초안은 Claude 검토 후 확정. 프롬프트는 `docs/KICKOFF.md` 하단.
 - **GPT-5.6 Sol (구현)** — ROADMAP 순서대로 구현. 각 마일스톤마다 검증 명령을 통과시키고 LOG에 기록한다. 설계와 다르게 해야 하면 LOG에 이유를 쓰고 진행한다(막히지 않는다).
 
 ## 절대 규칙
@@ -51,7 +52,11 @@ cargo run --release                             # 실제 플레이
 
 ## 문서 지도
 
-- `docs/BLUEPRINT.md` — 설계도 (Claude 소유)
-- `docs/ROADMAP.md` — 마일스톤·완료 조건 (Claude 소유)
+- `docs/BLUEPRINT.md` — 설계도. §0~§14 Claude 원본(M0~M5), §15~ GPT Pro 초안 → Claude 확정
+- `docs/ROADMAP.md` — 마일스톤·완료 조건·검증 명령. M0~M5 완료, M6~M10 확장 중
 - `docs/LOG.md` — 세션 로그, 위에 새 항목 추가 (모두 기록)
-- `docs/KICKOFF.md` — GPT 세션 시작용 프롬프트 (진헌이 붙여 넣음)
+- `docs/KICKOFF.md` — 세션 시작용 프롬프트 모음 (Sol 구현용, GPT Pro 설계 확장용)
+
+## 현재 상태 (2026-09-04 20:40)
+
+M0~M5 완료·리뷰 통과(커밋 `ad8406f`, `7453ab4`). 테스트 53개, R=12 정착 2.17초, 60fps. 다음은 M6(플러드필 조명·낮밤·바람). M6~M10 설계 확장은 GPT Pro가 초안한다.
