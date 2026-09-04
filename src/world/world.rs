@@ -68,6 +68,10 @@ impl World {
         self.chunks.get(&cp)
     }
 
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
     pub fn padded(&self, cp: IVec3) -> PaddedChunk {
         let mut padded = PaddedChunk::new();
         for y in -1..=CHUNK_SIZE {
@@ -108,16 +112,70 @@ impl World {
     }
 
     pub fn unload_outside(&mut self, center: IVec3, radius: i32) {
-        self.chunks.retain(|cp, _| {
-            let keep = (cp.x - center.x).abs() <= radius && (cp.z - center.z).abs() <= radius;
-            if !keep {
-                self.dirty.remove(cp);
+        let removed: Vec<IVec3> = self
+            .chunks
+            .keys()
+            .copied()
+            .filter(|cp| (cp.x - center.x).abs() > radius || (cp.z - center.z).abs() > radius)
+            .collect();
+
+        for cp in &removed {
+            self.chunks.remove(cp);
+            self.dirty.remove(cp);
+        }
+
+        for cp in removed {
+            for axis in 0..3 {
+                for sign in [-1, 1] {
+                    let mut neighbor = cp;
+                    match axis {
+                        0 => neighbor.x += sign,
+                        1 => neighbor.y += sign,
+                        _ => neighbor.z += sign,
+                    }
+                    if self.chunks.contains_key(&neighbor) {
+                        self.dirty.insert(neighbor);
+                    }
+                }
             }
-            keep
-        });
+        }
     }
 
     pub fn take_dirty(&mut self) -> Vec<IVec3> {
         self.dirty.drain().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::World;
+    use crate::world::coords::WORLD_CHUNKS_Y;
+    use glam::IVec3;
+
+    #[test]
+    fn unload_marks_kept_face_neighbor_dirty_without_duplicate_loads() {
+        let mut world = World::new(0);
+        let kept = IVec3::new(0, 0, 0);
+        let removed = IVec3::new(1, 0, 0);
+
+        assert!(world.ensure_loaded(kept));
+        assert!(world.ensure_loaded(removed));
+        assert_eq!(world.chunk_count(), 2);
+        world.take_dirty();
+
+        world.unload_outside(kept, 0);
+
+        assert_eq!(world.chunk_count(), 1);
+        assert!(world.chunk(kept).is_some());
+        assert!(world.chunk(removed).is_none());
+        assert_eq!(world.take_dirty(), vec![kept]);
+
+        assert!(world.ensure_loaded(removed));
+        assert_eq!(world.chunk_count(), 2);
+        assert!(!world.ensure_loaded(removed));
+        assert_eq!(world.chunk_count(), 2);
+        assert!(world.chunk(removed).is_some());
+        assert!(!world.ensure_loaded(IVec3::new(0, WORLD_CHUNKS_Y, 0)));
+        assert_eq!(world.chunk_count(), 2);
     }
 }

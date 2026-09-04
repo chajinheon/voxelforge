@@ -2,6 +2,7 @@
 name = "voxelforge"
 version = "0.1.0"
 edition = "2024"
+default-run = "voxelforge"
 description = "Minecraft-style voxel building game for macOS (Rust + wgpu/Metal)"
 
 # Debug builds: optimize dependencies fully and our code lightly so meshing

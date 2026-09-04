@@ -13,6 +13,14 @@
 
 ---
 
+## 2026-09-04 12:25  M2 — GPT-5.6 Sol
+
+- 한 것: 비행 `Camera`/`Controller`, 마우스 시선과 커서 잠금, WASD·상하 이동·스프린트, 플레이어 중심 R=6 스트리밍, 프레임당 생성 4/메시 8 예산, R+2 언로드와 경계 이웃 dirty 전파, GPU 메시 제거·교체, 1초 창 제목 통계를 구현했다. `cargo run`이 게임 바이너리를 고르도록 `default-run`을 지정했다.
+- 검증: `cargo test` → 17 passed. `cargo clippy --all-targets -- -D warnings` 통과. `cargo run --release --bin snapshot -- --pos 100,90,-60 --yaw 2.4 --pitch -0.35 --out /tmp/vf_m2.png` → Metal, 1280×720 PNG 생성·확인. `VF_SMOKE_FRAMES=600 cargo run --release --bin voxelforge` → 약 10초/600프레임(60fps), R=6 전체 로딩에 필요한 338프레임을 넘겨 패닉 없이 종료. 문서 그대로 `VF_SMOKE_FRAMES=60 cargo run --release`도 Metal 60프레임 통과했다. 별도 무제한 실행은 1분 이상 안정 동작 후 종료했다.
+- 설계와 다르게 한 것 / 제안: 없음.
+- 열린 문제: 실행 도구가 번들 없는 winit 창에 접근성 입력을 연결하지 못해 실제 마우스/키보드 5분 비행은 자동화하지 못했다. 컨트롤러 단위 테스트와 이벤트 배선 검토는 통과했으며 최종 M3 플레이 리뷰에서 함께 확인한다.
+- 다음: M3 DDA 레이캐스트·outline·부수기/놓기·핫바.
+
 ## 2026-09-04 12:05  M1 — GPT-5.6 Sol
 
 - 한 것: 좌표·블록·청크·월드젠·월드 dirty 관리, 34³ 패딩 기반 culled 메셔와 정점 AO/8바이트 패킹, 절차적 16×16 텍스처 배열, dynamic-offset 청크 유니폼 렌더러, WGSL 핫리로드, 창 없는 오프스크린 readback, 고정 카메라 창 앱과 `snapshot` 바이너리를 구현했다. 독립 리뷰에서 발견된 AO 코너 방향 반전을 수정했다.
