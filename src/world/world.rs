@@ -2,21 +2,32 @@ use super::block::{AIR, BlockId, STONE};
 use super::chunk::{Chunk, PaddedChunk};
 use super::coords::{CHUNK_SIZE, WORLD_CHUNKS_Y, chunk_of, local_of};
 use super::r#gen::WorldGen;
+use super::save::SaveDir;
+use anyhow::{Context, Result};
 use glam::IVec3;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub struct World {
     pub(crate) chunks: HashMap<IVec3, Chunk>,
-    pub(crate) generator: WorldGen,
+    pub(crate) generator: Arc<WorldGen>,
+    seed: u64,
+    versions: HashMap<IVec3, u64>,
     dirty: HashSet<IVec3>,
+    pub(crate) modified: HashSet<IVec3>,
+    pub(crate) saved_version: HashMap<IVec3, u64>,
 }
 
 impl World {
     pub fn new(seed: u64) -> Self {
         Self {
             chunks: HashMap::new(),
-            generator: WorldGen::new(seed),
+            generator: Arc::new(WorldGen::new(seed)),
+            seed,
+            versions: HashMap::new(),
             dirty: HashSet::new(),
+            modified: HashSet::new(),
+            saved_version: HashMap::new(),
         }
     }
 
@@ -40,8 +51,13 @@ impl World {
             return false;
         };
         let local = local_of(bp);
+        if chunk.get(local) == id {
+            return false;
+        }
         chunk.set(local, id);
+        *self.versions.entry(cp).or_insert(1) += 1;
         self.dirty.insert(cp);
+        self.modified.insert(cp);
         for (axis, sign) in [
             (
                 0,
@@ -83,6 +99,94 @@ impl World {
 
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    pub fn is_loaded(&self, cp: IVec3) -> bool {
+        self.chunks.contains_key(&cp)
+    }
+
+    pub fn insert_generated(&mut self, cp: IVec3, chunk: Chunk) {
+        if !(0..WORLD_CHUNKS_Y).contains(&cp.y) || self.chunks.contains_key(&cp) {
+            return;
+        }
+        self.chunks.insert(cp, chunk);
+        self.versions.insert(cp, 1);
+        self.dirty.insert(cp);
+        for axis in 0..3 {
+            for sign in [-1, 1] {
+                let mut n = cp;
+                match axis {
+                    0 => n.x += sign,
+                    1 => n.y += sign,
+                    _ => n.z += sign,
+                }
+                if self.chunks.contains_key(&n) {
+                    self.dirty.insert(n);
+                }
+            }
+        }
+    }
+
+    /// Insert a chunk read from disk and retain its modified identity so later
+    /// edits are persisted without treating the loaded bytes as a new change.
+    pub fn insert_loaded(&mut self, cp: IVec3, chunk: Chunk) {
+        if !(0..WORLD_CHUNKS_Y).contains(&cp.y) || self.chunks.contains_key(&cp) {
+            return;
+        }
+        self.chunks.insert(cp, chunk);
+        self.versions.insert(cp, 1);
+        self.saved_version.insert(cp, 1);
+        self.modified.insert(cp);
+        self.dirty.insert(cp);
+        for axis in 0..3 {
+            for sign in [-1, 1] {
+                let mut n = cp;
+                match axis {
+                    0 => n.x += sign,
+                    1 => n.y += sign,
+                    _ => n.z += sign,
+                }
+                if self.chunks.contains_key(&n) {
+                    self.dirty.insert(n);
+                }
+            }
+        }
+    }
+
+    pub fn chunk_version(&self, cp: IVec3) -> Option<u64> {
+        self.versions.get(&cp).copied()
+    }
+
+    pub fn generator(&self) -> &Arc<WorldGen> {
+        &self.generator
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Persist changed loaded chunks and return the number of files written.
+    pub fn save_modified(&mut self, save: &SaveDir) -> Result<usize> {
+        let mut targets: Vec<_> = self.modified.iter().copied().collect();
+        targets.sort_by_key(|cp| (cp.x, cp.y, cp.z));
+        let mut written = 0;
+        for cp in targets {
+            let Some(version) = self.versions.get(&cp).copied() else {
+                continue;
+            };
+            if self.saved_version.get(&cp) == Some(&version) {
+                continue;
+            }
+            let Some(chunk) = self.chunks.get(&cp) else {
+                log::warn!("cannot save unloaded modified chunk {cp:?}");
+                continue;
+            };
+            save.write_chunk(cp, chunk)
+                .with_context(|| format!("save modified chunk {cp:?}"))?;
+            self.saved_version.insert(cp, version);
+            written += 1;
+        }
+        Ok(written)
     }
 
     pub fn padded(&self, cp: IVec3) -> PaddedChunk {
@@ -148,21 +252,7 @@ impl World {
             return false;
         }
         let chunk = self.generator.generate(cp);
-        self.chunks.insert(cp, chunk);
-        self.dirty.insert(cp);
-        for axis in 0..3 {
-            for sign in [-1, 1] {
-                let mut n = cp;
-                match axis {
-                    0 => n.x += sign,
-                    1 => n.y += sign,
-                    _ => n.z += sign,
-                }
-                if self.chunks.contains_key(&n) {
-                    self.dirty.insert(n);
-                }
-            }
-        }
+        self.insert_generated(cp, chunk);
         true
     }
 
@@ -176,6 +266,7 @@ impl World {
 
         for cp in &removed {
             self.chunks.remove(cp);
+            self.versions.remove(cp);
             self.dirty.remove(cp);
         }
 
@@ -204,7 +295,7 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::World;
-    use crate::world::block::STONE;
+    use crate::world::block::AIR;
     use crate::world::coords::{CHUNK_SIZE, WORLD_CHUNKS_Y};
     use glam::IVec3;
 
@@ -247,12 +338,33 @@ mod tests {
         assert!(world.ensure_loaded(opposite_neighbor));
         world.take_dirty();
 
-        assert!(world.set_block(edited * CHUNK_SIZE, STONE));
+        let neighbor_version = world.chunk_version(touched_neighbor).unwrap();
+        assert!(world.set_block(edited * CHUNK_SIZE, AIR));
 
         let dirty = world.take_dirty();
         assert!(dirty.contains(&edited));
         assert!(dirty.contains(&touched_neighbor));
         assert!(!dirty.contains(&opposite_neighbor));
+        assert_eq!(
+            world.chunk_version(touched_neighbor),
+            Some(neighbor_version)
+        );
+    }
+
+    #[test]
+    fn loading_adjacent_chunks_does_not_change_content_versions() {
+        let mut world = World::new(0);
+        let first = IVec3::new(0, 0, 0);
+        let second = IVec3::new(1, 0, 0);
+
+        world.insert_loaded(first, crate::world::chunk::Chunk::new_air());
+        assert_eq!(world.chunk_version(first), Some(1));
+        world.insert_loaded(second, crate::world::chunk::Chunk::new_air());
+
+        assert_eq!(world.chunk_version(first), Some(1));
+        assert_eq!(world.chunk_version(second), Some(1));
+        assert_eq!(world.saved_version.get(&first), Some(&1));
+        assert_eq!(world.saved_version.get(&second), Some(&1));
     }
 
     #[test]

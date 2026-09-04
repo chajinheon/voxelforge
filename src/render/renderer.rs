@@ -2,11 +2,13 @@
 
 use std::path::Path;
 
-use super::chunk_pipeline::{ChunkPipeline, GpuChunk};
+use super::chunk_pipeline::{ChunkPipeline, GpuChunk, GpuChunkMeshes};
+use super::frustum::Frustum;
 use super::globals::Globals;
 use super::outline::OutlinePipeline;
 use super::shader_watch::ShaderWatcher;
 use super::textures::BlockTextures;
+use super::translucent::TranslucentPipeline;
 
 const SKY: wgpu::Color = wgpu::Color {
     r: 0.53,
@@ -22,6 +24,7 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     pub textures: BlockTextures,
     pub chunks: ChunkPipeline,
+    pub translucent: TranslucentPipeline,
     pub outline: OutlinePipeline,
     watcher: ShaderWatcher,
     outline_watcher: ShaderWatcher,
@@ -48,6 +51,8 @@ impl Renderer {
         let textures = BlockTextures::from_registry(device, queue, asset_root)?;
         let shader_path = asset_root.join("shaders/chunk.wgsl");
         let chunks = ChunkPipeline::new(device, queue, color_format, &textures, &shader_path)?;
+        let translucent =
+            TranslucentPipeline::new(device, queue, color_format, &textures, &shader_path)?;
         let outline_path = asset_root.join("shaders/outline.wgsl");
         let outline = OutlinePipeline::new(
             device,
@@ -61,6 +66,7 @@ impl Renderer {
             queue: queue.clone(),
             textures,
             chunks,
+            translucent,
             outline,
             watcher: ShaderWatcher::new(shader_path),
             outline_watcher: ShaderWatcher::new(outline_path),
@@ -81,6 +87,54 @@ impl Renderer {
         self.chunks.remove_chunk(chunk);
     }
 
+    /// Upload both render passes for one chunk. If either pass fails, the
+    /// already-uploaded pass is returned to its arena before reporting error.
+    pub fn upload_chunk_meshes(
+        &mut self,
+        meshes: &crate::mesh::mesher::ChunkMeshes,
+        origin: glam::IVec3,
+    ) -> anyhow::Result<GpuChunkMeshes> {
+        let opaque = if meshes.opaque.vertices.is_empty() || meshes.opaque.indices.is_empty() {
+            None
+        } else {
+            Some(
+                self.chunks
+                    .upload_chunk(&self.device, &self.queue, &meshes.opaque, origin)?,
+            )
+        };
+        let translucent = match if meshes.translucent.vertices.is_empty()
+            || meshes.translucent.indices.is_empty()
+        {
+            Ok(None)
+        } else {
+            self.translucent
+                .upload_chunk(&self.device, &self.queue, &meshes.translucent, origin)
+                .map(Some)
+        } {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                if let Some(chunk) = opaque {
+                    self.chunks.remove_chunk(chunk);
+                }
+                return Err(error);
+            }
+        };
+        Ok(GpuChunkMeshes {
+            opaque,
+            translucent,
+            origin,
+        })
+    }
+
+    pub fn remove_chunk_meshes(&mut self, meshes: GpuChunkMeshes) {
+        if let Some(chunk) = meshes.opaque {
+            self.chunks.remove_chunk(chunk);
+        }
+        if let Some(chunk) = meshes.translucent {
+            self.translucent.remove_chunk(chunk);
+        }
+    }
+
     /// Force a shader recompile on the next frame.
     pub fn force_shader_reload(&mut self) {
         self.watcher.force();
@@ -93,9 +147,9 @@ impl Renderer {
         color_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
         globals: &Globals,
-        chunks: &[GpuChunk],
-    ) {
-        self.render_internal(color_view, depth_view, globals, chunks, None);
+        chunks: &[GpuChunkMeshes],
+    ) -> usize {
+        self.render_internal(color_view, depth_view, globals, chunks, None)
     }
 
     /// Render an opaque frame and optionally draw the selected block outline.
@@ -104,10 +158,10 @@ impl Renderer {
         color_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
         globals: &Globals,
-        chunks: &[GpuChunk],
+        chunks: &[GpuChunkMeshes],
         selected_block: Option<glam::IVec3>,
-    ) {
-        self.render_internal(color_view, depth_view, globals, chunks, selected_block);
+    ) -> usize {
+        self.render_internal(color_view, depth_view, globals, chunks, selected_block)
     }
 
     fn render_internal(
@@ -115,16 +169,20 @@ impl Renderer {
         color_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
         globals: &Globals,
-        chunks: &[GpuChunk],
+        chunks: &[GpuChunkMeshes],
         selected_block: Option<glam::IVec3>,
-    ) {
+    ) -> usize {
         if self.watcher.poll() {
             let _ = self.chunks.reload_shader(&self.device, self.color_format);
+            let _ = self
+                .translucent
+                .reload_shader(&self.device, self.color_format);
         }
         if self.outline_watcher.poll() {
             let _ = self.outline.reload_shader(&self.device, self.color_format);
         }
         self.chunks.update_globals(&self.queue, globals);
+        self.translucent.update_globals(&self.queue, globals);
         if let Some(block) = selected_block {
             self.outline.update(&self.queue, block);
         }
@@ -133,6 +191,36 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("voxelforge-frame"),
             });
+        let frustum = Frustum::from_view_proj(glam::Mat4::from_cols_array_2d(&globals.view_proj));
+        let visible_chunks = chunks
+            .iter()
+            .filter(|chunk| {
+                let min = chunk.origin.as_vec3();
+                let max = min + glam::Vec3::splat(crate::world::coords::CHUNK_SIZE as f32);
+                frustum.intersects_aabb(min, max)
+                    && (chunk.opaque.is_some() || chunk.translucent.is_some())
+            })
+            .count();
+        let opaque: Vec<&GpuChunk> = chunks
+            .iter()
+            .filter_map(|chunk| chunk.opaque.as_ref())
+            .collect();
+        let mut translucent: Vec<&GpuChunk> = chunks
+            .iter()
+            .filter_map(|chunk| chunk.translucent.as_ref())
+            .collect();
+        let camera =
+            glam::Vec3::from_array([globals.cam_pos[0], globals.cam_pos[1], globals.cam_pos[2]]);
+        translucent.sort_by(|a, b| {
+            let distance = |chunk: &GpuChunk| {
+                let center = chunk.origin.as_vec3()
+                    + glam::Vec3::splat(crate::world::coords::CHUNK_SIZE as f32 * 0.5);
+                center.distance_squared(camera)
+            };
+            distance(b)
+                .partial_cmp(&distance(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("voxelforge-opaque-pass"),
@@ -157,11 +245,13 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.chunks.draw(&mut pass, chunks);
+            self.chunks.draw_visible(&mut pass, &opaque, &frustum);
             if selected_block.is_some() {
                 self.outline.draw(&mut pass);
             }
+            self.translucent.draw(&mut pass, &translucent, &frustum);
         }
         self.queue.submit([encoder.finish()]);
+        visible_chunks
     }
 }

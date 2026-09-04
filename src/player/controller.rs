@@ -2,9 +2,7 @@ use glam::Vec3;
 use winit::keyboard::KeyCode;
 
 use super::camera::Camera;
-
-const BASE_SPEED: f32 = 12.0;
-const SPRINT_MULTIPLIER: f32 = 3.0;
+use super::physics::MoveInput;
 const MOUSE_SENSITIVITY: f32 = 0.002;
 const MAX_PITCH: f32 = 89.0_f32.to_radians();
 
@@ -47,8 +45,8 @@ impl Controller {
         self.mouse_dy += dy;
     }
 
-    /// Applies pending look input and moves the camera for one frame.
-    pub fn update(&mut self, camera: &mut Camera, dt: f32) {
+    /// Applies pending look input and returns a world-space movement wish.
+    pub fn update(&mut self, camera: &mut Camera) -> MoveInput {
         camera.yaw += self.mouse_dx as f32 * MOUSE_SENSITIVITY;
         camera.pitch -= self.mouse_dy as f32 * MOUSE_SENSITIVITY;
         camera.pitch = camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
@@ -75,17 +73,13 @@ impl Controller {
             horizontal = horizontal.normalize();
         }
 
-        let vertical = self.up as i8 as f32 - self.down as i8 as f32;
-        let mut movement = horizontal + Vec3::Y * vertical;
-        if movement != Vec3::ZERO {
-            movement = movement.normalize();
+        MoveInput {
+            wish: horizontal,
+            jump: self.up,
+            sprint: self.sprint,
+            up: self.up,
+            down: self.down,
         }
-        let speed = if self.sprint {
-            BASE_SPEED * SPRINT_MULTIPLIER
-        } else {
-            BASE_SPEED
-        };
-        camera.pos += movement * speed * dt;
     }
 
     /// Clears all held input and pending mouse motion.
@@ -116,9 +110,9 @@ mod tests {
         let mut camera = camera();
         controller.set_key(KeyCode::KeyW, true);
         controller.set_key(KeyCode::KeyD, true);
-        controller.update(&mut camera, 1.0);
-        assert!((camera.pos.length() - 12.0).abs() < 1e-5);
-        assert!(camera.pos.x > 0.0 && camera.pos.z < 0.0);
+        let input = controller.update(&mut camera);
+        assert!((input.wish.length() - 1.0).abs() < 1e-5);
+        assert!(input.wish.x > 0.0 && input.wish.z < 0.0);
     }
 
     #[test]
@@ -126,31 +120,32 @@ mod tests {
         let mut controller = Controller::new();
         let mut camera = camera();
         controller.mouse_motion(10.0, 10.0);
-        controller.update(&mut camera, 0.0);
+        controller.update(&mut camera);
         assert!((camera.yaw - 0.02).abs() < 1e-6);
         assert!((camera.pitch + 0.02).abs() < 1e-6);
         controller.mouse_motion(0.0, -100_000.0);
-        controller.update(&mut camera, 0.0);
+        controller.update(&mut camera);
         assert!((camera.pitch - MAX_PITCH).abs() < 1e-6);
     }
 
     #[test]
-    fn sprint_multiplies_speed_by_three() {
+    fn sprint_is_reported_in_move_input() {
         let mut controller = Controller::new();
         let mut camera = camera();
         controller.set_key(KeyCode::KeyW, true);
         controller.set_key(KeyCode::ControlLeft, true);
-        controller.update(&mut camera, 1.0);
-        assert!((camera.pos.length() - 36.0).abs() < 1e-5);
+        let input = controller.update(&mut camera);
+        assert!(input.sprint);
     }
 
     #[test]
-    fn vertical_and_horizontal_input_is_normalized() {
+    fn vertical_input_is_separate_from_horizontal_wish() {
         let mut controller = Controller::new();
         let mut camera = camera();
         controller.set_key(KeyCode::KeyW, true);
         controller.set_key(KeyCode::Space, true);
-        controller.update(&mut camera, 1.0);
-        assert!((camera.pos.length() - 12.0).abs() < 1e-5);
+        let input = controller.update(&mut camera);
+        assert_eq!(input.wish, Vec3::NEG_Z);
+        assert!(input.jump && input.up);
     }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use voxelforge::render::{Globals, Gpu, GpuChunk, Renderer};
+use voxelforge::render::{Globals, Gpu, GpuChunkMeshes, Renderer};
 use winit::window::Window;
 
 pub(crate) struct WindowGpu {
@@ -56,31 +56,31 @@ impl WindowGpu {
         &self,
         renderer: &mut Renderer,
         globals: &Globals,
-        chunks: &[GpuChunk],
+        chunks: &[GpuChunkMeshes],
         outline: Option<glam::IVec3>,
-    ) -> bool {
+    ) -> Option<usize> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
+                return None;
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return false;
+                return None;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 log::error!("surface validation error while acquiring frame");
-                return false;
+                return None;
             }
         };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        renderer.render_with_outline(&view, &self.depth_view, globals, chunks, outline);
+        let drawn = renderer.render_with_outline(&view, &self.depth_view, globals, chunks, outline);
         self.window.pre_present_notify();
         self.queue.present(frame);
-        true
+        Some(drawn)
     }
 }
 

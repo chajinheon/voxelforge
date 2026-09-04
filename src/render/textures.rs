@@ -202,7 +202,12 @@ fn procedural_layer(name: &str, layer: u64) -> Vec<u8> {
                 _ => noisy([190, 190, 190], x, y, layer),
             };
             let index = ((y * SIZE + x) * 4) as usize;
-            out[index..index + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
+            let alpha = match name {
+                "water" => 150,
+                "glass" => 90,
+                _ => 255,
+            };
+            out[index..index + 4].copy_from_slice(&[color[0], color[1], color[2], alpha]);
         }
     }
     out

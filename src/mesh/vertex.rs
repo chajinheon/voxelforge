@@ -8,6 +8,9 @@ pub struct ChunkVertex {
     pub b: u32,
 }
 
+/// Reserved vertex bit used to lower the top surface of fluid blocks.
+pub const LOWERED_BIT: u32 = 1 << 23;
+
 /// Pack a vertex using the layout in BLUEPRINT §4.
 #[allow(clippy::too_many_arguments)] // The eight-argument signature is a fixed data contract.
 pub fn pack(
@@ -27,6 +30,19 @@ pub fn pack(
         | ((ao & 0x3) << 21);
     let b = (tex & 0xffff) | ((light & 0xf) << 16) | ((sky & 0xf) << 20);
     ChunkVertex { a, b }
+}
+
+pub fn with_lowered(mut vertex: ChunkVertex, lowered: bool) -> ChunkVertex {
+    if lowered {
+        vertex.a |= LOWERED_BIT;
+    } else {
+        vertex.a &= !LOWERED_BIT;
+    }
+    vertex
+}
+
+pub fn is_lowered(vertex: ChunkVertex) -> bool {
+    vertex.a & LOWERED_BIT != 0
 }
 
 /// Unpack all defined fields. Reserved bits are intentionally omitted.

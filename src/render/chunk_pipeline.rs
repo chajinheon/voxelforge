@@ -8,12 +8,14 @@ use glam::IVec3;
 
 use crate::mesh::mesher::ChunkMesh;
 use crate::mesh::vertex::ChunkVertex;
+use crate::world::coords::CHUNK_SIZE;
 
+use super::frustum::Frustum;
 use super::globals::{GLOBALS_SIZE, Globals};
 use super::textures::BlockTextures;
 
 const CHUNK_UNIFORM_SIZE: u64 = 16;
-const DEFAULT_SLOTS: u32 = 4096;
+const DEFAULT_SLOTS: u32 = 16384;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -31,6 +33,14 @@ pub struct GpuChunk {
     slot: u32,
 }
 
+/// The two GPU passes belonging to one world chunk. Uploads and removals are
+/// performed as one unit by the renderer/streamer even when one pass is empty.
+pub struct GpuChunkMeshes {
+    pub opaque: Option<GpuChunk>,
+    pub translucent: Option<GpuChunk>,
+    pub origin: IVec3,
+}
+
 /// Opaque chunk pipeline and its dynamic-offset uniform arena.
 pub struct ChunkPipeline {
     pub pipeline: wgpu::RenderPipeline,
@@ -46,6 +56,7 @@ pub struct ChunkPipeline {
     slot_size: u64,
     free_slots: Vec<u32>,
     shader_path: std::path::PathBuf,
+    blend: bool,
 }
 
 impl ChunkPipeline {
@@ -57,6 +68,27 @@ impl ChunkPipeline {
         color_format: wgpu::TextureFormat,
         textures: &BlockTextures,
         shader_path: impl AsRef<Path>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_mode(device, queue, color_format, textures, shader_path, false)
+    }
+
+    pub(crate) fn new_translucent(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        color_format: wgpu::TextureFormat,
+        textures: &BlockTextures,
+        shader_path: impl AsRef<Path>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_mode(device, queue, color_format, textures, shader_path, true)
+    }
+
+    fn new_with_mode(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        color_format: wgpu::TextureFormat,
+        textures: &BlockTextures,
+        shader_path: impl AsRef<Path>,
+        translucent: bool,
     ) -> anyhow::Result<Self> {
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("globals-layout"),
@@ -177,7 +209,7 @@ impl ChunkPipeline {
             label: Some("chunk-shader"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        let pipeline = create_pipeline(device, &layout, &shader_module, color_format);
+        let pipeline = create_pipeline(device, &layout, &shader_module, color_format, translucent);
         if let Some(error) = pollster::block_on(scope.pop()) {
             anyhow::bail!("chunk shader validation failed: {error}");
         }
@@ -196,6 +228,7 @@ impl ChunkPipeline {
             slot_size,
             free_slots: (0..DEFAULT_SLOTS).rev().collect(),
             shader_path,
+            blend: translucent,
         })
     }
 
@@ -297,7 +330,13 @@ impl ChunkPipeline {
             ],
             immediate_size: 0,
         });
-        let pipeline = create_pipeline(device, &pipeline_layout, &module, color_format);
+        let pipeline = create_pipeline(
+            device,
+            &pipeline_layout,
+            &module,
+            color_format,
+            self.is_translucent(),
+        );
         if let Some(error) = pollster::block_on(scope.pop()) {
             log::error!("shader reload validation failed: {error}");
             return false;
@@ -310,15 +349,51 @@ impl ChunkPipeline {
 
     /// Draw all non-empty chunks into an active render pass.
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, chunks: &'a [GpuChunk]) {
+        self.set_state(pass);
+        for chunk in chunks {
+            self.draw_unchecked(pass, chunk);
+        }
+    }
+
+    pub(crate) fn draw_visible<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        chunks: &[&'a GpuChunk],
+        frustum: &Frustum,
+    ) -> usize {
+        self.set_state(pass);
+        let mut drawn = 0;
+        for chunk in chunks {
+            let min = chunk.origin.as_vec3();
+            let max = min + glam::Vec3::splat(CHUNK_SIZE as f32);
+            if !frustum.intersects_aabb(min, max) {
+                continue;
+            }
+            self.draw_unchecked(pass, chunk);
+            drawn += 1;
+        }
+        drawn
+    }
+
+    pub(crate) fn set_state<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
         pass.set_bind_group(1, &self.texture_bind_group, &[]);
-        for chunk in chunks {
-            pass.set_bind_group(2, &self.chunk_bind_group, &[chunk.uniform_offset]);
-            pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
-            pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..chunk.index_count, 0, 0..1);
-        }
+    }
+
+    pub(crate) fn draw_unchecked<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        chunk: &'a GpuChunk,
+    ) {
+        pass.set_bind_group(2, &self.chunk_bind_group, &[chunk.uniform_offset]);
+        pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
+        pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..chunk.index_count, 0, 0..1);
+    }
+
+    fn is_translucent(&self) -> bool {
+        self.blend
     }
 }
 
@@ -327,6 +402,7 @@ fn create_pipeline(
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
+    translucent: bool,
 ) -> wgpu::RenderPipeline {
     const ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Uint32x2];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -345,12 +421,12 @@ fn create_pipeline(
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
+            cull_mode: (!translucent).then_some(wgpu::Face::Back),
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: Some(true),
+            depth_write_enabled: Some(!translucent),
             depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: Default::default(),
             bias: Default::default(),
@@ -362,7 +438,7 @@ fn create_pipeline(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: color_format,
-                blend: None,
+                blend: translucent.then_some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),

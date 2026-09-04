@@ -3,9 +3,10 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use glam::{IVec3, Mat4, Vec3};
-use voxelforge::mesh::mesh_chunk;
-use voxelforge::render::{Globals, Gpu, GpuChunk, OffscreenTarget, Renderer};
+use glam::{IVec3, Vec3};
+use voxelforge::mesh::{ChunkMeshes, mesh_chunk_all, mesh_chunk_greedy_all};
+use voxelforge::render::{Globals, Gpu, GpuChunkMeshes, OffscreenTarget, Renderer};
+use voxelforge::world::block::{AIR, BlockId, COBBLE};
 use voxelforge::world::coords::{WORLD_CHUNKS_Y, chunk_of};
 use voxelforge::world::r#gen::WorldGen;
 use voxelforge::world::world::World;
@@ -21,6 +22,18 @@ const FOV_Y: f32 = 60.0_f32.to_radians();
 const NEAR: f32 = 0.05;
 const FAR: f32 = 1000.0;
 
+#[derive(Clone, Copy, Debug)]
+enum MesherMode {
+    Culled,
+    Greedy,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Edit {
+    position: IVec3,
+    id: BlockId,
+}
+
 struct Options {
     seed: u64,
     pos: Option<Vec3>,
@@ -30,6 +43,8 @@ struct Options {
     width: u32,
     height: u32,
     out: PathBuf,
+    edits: Vec<Edit>,
+    mesher: MesherMode,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,7 +62,15 @@ fn main() -> anyhow::Result<()> {
         .pos
         .unwrap_or_else(|| Vec3::new(0.0, generator.height_at(0, 0) as f32 + 3.0, 0.0));
     let target = OffscreenTarget::new(&gpu.device, options.width, options.height)?;
-    let chunks = build_terrain(&mut renderer, options.seed, position, options.radius)?;
+    log::info!("snapshot: mesher={}", options.mesher.name());
+    let chunks = build_terrain(
+        &mut renderer,
+        options.seed,
+        position,
+        options.radius,
+        &options.edits,
+        options.mesher,
+    )?;
     let globals = make_globals(
         position,
         options.yaw,
@@ -80,7 +103,9 @@ fn build_terrain(
     seed: u64,
     position: Vec3,
     radius: i32,
-) -> anyhow::Result<Vec<GpuChunk>> {
+    edits: &[Edit],
+    mesher: MesherMode,
+) -> anyhow::Result<Vec<GpuChunkMeshes>> {
     let center = chunk_of(IVec3::new(
         position.x.floor() as i32,
         position.y.floor() as i32,
@@ -95,6 +120,15 @@ fn build_terrain(
         }
     }
 
+    for edit in edits {
+        if !world.set_block(edit.position, edit.id) {
+            anyhow::bail!(
+                "edit position {:?} is outside the loaded world or vertical bounds",
+                edit.position
+            );
+        }
+    }
+
     let mut dirty = world.take_dirty();
     dirty.sort_by_key(|cp| {
         (
@@ -105,20 +139,32 @@ fn build_terrain(
         )
     });
     let mut gpu_chunks = Vec::with_capacity(dirty.len());
+    let mut vertex_count = 0usize;
+    let mut index_count = 0usize;
     for cp in dirty {
-        let mesh = mesh_chunk(&world.padded(cp));
-        if !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
-            gpu_chunks.push(renderer.upload_chunk(&mesh, cp * 32)?);
+        let padded = world.padded(cp);
+        let meshes = mesher.mesh(&padded);
+        vertex_count += meshes.opaque.vertices.len() + meshes.translucent.vertices.len();
+        index_count += meshes.opaque.indices.len() + meshes.translucent.indices.len();
+        if !(meshes.opaque.vertices.is_empty() && meshes.translucent.vertices.is_empty()) {
+            gpu_chunks.push(renderer.upload_chunk_meshes(&meshes, cp * 32)?);
         }
     }
+    log::info!(
+        "snapshot: mesher={} vertices {vertex_count} indices {index_count}",
+        mesher.name()
+    );
     Ok(gpu_chunks)
 }
 
-#[allow(deprecated)] // BLUEPRINT D4 fixes these exact glam constructors.
 fn make_globals(position: Vec3, yaw: f32, pitch: f32, width: u32, height: u32) -> Globals {
-    let view = Mat4::look_to_rh(position, forward(yaw, pitch), Vec3::Y);
-    let projection =
-        Mat4::perspective_rh(FOV_Y, width.max(1) as f32 / height.max(1) as f32, NEAR, FAR);
+    let view = glam::camera::rh::view::look_to_mat4(position, forward(yaw, pitch), Vec3::Y);
+    let projection = glam::camera::rh::proj::directx::perspective(
+        FOV_Y,
+        width.max(1) as f32 / height.max(1) as f32,
+        NEAR,
+        FAR,
+    );
     Globals::new(
         projection * view,
         position,
@@ -150,6 +196,8 @@ where
         width: DEFAULT_WIDTH,
         height: DEFAULT_HEIGHT,
         out: PathBuf::from(DEFAULT_OUT),
+        edits: Vec::new(),
+        mesher: MesherMode::Greedy,
     };
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
@@ -174,9 +222,17 @@ where
                 options.height = height;
             }
             "--out" => options.out = PathBuf::from(value()?),
+            "--edits" => options.edits = parse_edits(&value()?)?,
+            "--mesher" => {
+                options.mesher = match value()?.as_str() {
+                    "culled" => MesherMode::Culled,
+                    "greedy" => MesherMode::Greedy,
+                    other => anyhow::bail!("--mesher must be culled or greedy, got {other:?}"),
+                };
+            }
             "--help" | "-h" => {
                 println!(
-                    "snapshot [--seed N] [--pos X,Y,Z] [--yaw R] [--pitch R] [--radius N] [--size WxH] [--out PATH]"
+                    "snapshot [--seed N] [--pos X,Y,Z] [--yaw R] [--pitch R] [--radius N] [--size WxH] [--out PATH] [--edits \"set X,Y,Z,ID; ...\"] [--mesher culled|greedy]"
                 );
                 std::process::exit(0);
             }
@@ -184,6 +240,57 @@ where
         }
     }
     Ok(options)
+}
+
+impl MesherMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Culled => "culled",
+            Self::Greedy => "greedy",
+        }
+    }
+
+    fn mesh(self, padded: &voxelforge::world::chunk::PaddedChunk) -> ChunkMeshes {
+        match self {
+            Self::Culled => mesh_chunk_all(padded),
+            Self::Greedy => mesh_chunk_greedy_all(padded),
+        }
+    }
+}
+
+fn parse_edits(value: &str) -> anyhow::Result<Vec<Edit>> {
+    let mut edits = Vec::new();
+    for command in value.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let fields = command
+            .strip_prefix("set ")
+            .ok_or_else(|| anyhow::anyhow!("edit must use `set X,Y,Z,ID`: {command:?}"))?
+            .split(',')
+            .collect::<Vec<_>>();
+        if fields.len() != 4 {
+            anyhow::bail!("edit must use `set X,Y,Z,ID`: {command:?}");
+        }
+        let parse_coord = |field: &str| {
+            field
+                .parse::<i32>()
+                .with_context(|| format!("edit coordinate must be an integer: {field:?}"))
+        };
+        let position = IVec3::new(
+            parse_coord(fields[0])?,
+            parse_coord(fields[1])?,
+            parse_coord(fields[2])?,
+        );
+        let id = fields[3]
+            .parse::<BlockId>()
+            .with_context(|| format!("edit block id must be an integer: {:?}", fields[3]))?;
+        if id > COBBLE {
+            anyhow::bail!("edit block id must be between {AIR} and {COBBLE}: {id}");
+        }
+        edits.push(Edit { position, id });
+    }
+    if edits.is_empty() {
+        anyhow::bail!("--edits requires at least one `set X,Y,Z,ID` command");
+    }
+    Ok(edits)
 }
 
 fn parse_vec3(value: &str) -> anyhow::Result<Vec3> {

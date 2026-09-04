@@ -13,6 +13,22 @@
 
 ---
 
+## 2026-09-04 19:49  M5 — GPT-5.6 Sol
+
+- 한 것: 수정 청크만 LZ4로 저장하는 `VFC1` 청크 파일과 `world.json` 플레이어 메타데이터를 추가하고, `VF_SAVE`/`--save`, 파일 우선 비동기 로딩, 언로드 전·30초·종료 저장을 연결했다. 저장용 콘텐츠 version과 이웃 재메시용 monotonic epoch를 분리했다. WATER/GLASS를 opaque/translucent 메시로 나눠 같은 id 내부 면 컬링, 물 표면 1/8 하강 비트, alpha blend·depth-write off·cull none 파이프라인, 불투명→outline→투명 및 청크 단위 뒤→앞 정렬을 구현했다. serde 1.0.229, serde_json 1.0.151, lz4_flex 0.14.0을 사용했다.
+- 검증: `cargo test --all-targets` → 53 passed, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` 통과. 저장 우선 로딩은 실제 `Streamer`의 파일 감지→`Load` 잡→결과 적용 분기를 테스트했고 독립 코드 재검토도 PASS했다. 무편집 release smoke 저장 `saves/m5_manual_20260904_qa/`은 `world.json`만 있고 청크 파일 0개다. 물 `/tmp/vf_m5_water.png`에서 수면 아래 모래·지형, 유리 `/tmp/vf_m5_glass_visible.png`에서 창 뒤 나무·물·지형을 직접 확인했고 무편집 기준 대비 28,214픽셀(3.0614%)이 변했다. `VF_RADIUS=12 VF_SMOKE_FRAMES=900` Metal 실측은 정착 2.01초, 초기 max 20.4ms, 이후 60fps·steady max 18.6ms였다.
+- 설계와 다르게 한 것 / 제안: 선택 사항인 수중 틴트는 넣지 않았다. ROADMAP 유리 명령의 `--yaw 3.1416`은 현재 카메라 규약에서 창 반대를 보므로 시각 검증은 `--yaw 0`으로 다시 실행했다. M5.3 메시 아레나는 업로드 원인 20ms 초과가 확인되지 않아 조건대로 미구현하고 M7로 미뤘다.
+- 열린 문제: 실제 입력으로 블록을 놓고 종료·재실행하는 손 검증과 수중에서 수면 뒷면을 올려다보는 손 검증은 자동화하지 못했다. 저장/복원 경로, cull-none 설정, 물 lowered 정점은 단위·통합·스냅샷으로 검증했다. 현재 실행 정책이 `git commit`을 차단해 M4.0~M5.2 커밋은 아직 생성하지 못했다.
+- 다음: **M5 완료, 리뷰 요청.** Claude 리뷰와 손 플레이 뒤 M6.
+
+## 2026-09-04 17:50  M4 — GPT-5.6 Sol
+
+- 한 것: M4.0 리뷰 잔여(`snapshot --edits/--mesher`, WGSL·월드젠 정리, `chunk_of`, 16384 슬롯), rayon 1.12.0 + std mpsc 워커 스트리밍, greedy 메싱과 AO 대각선 뒤집기, 보행·점프·수영·비행 swept-AABB 물리, 결정적 나무·3D 동굴, 프러스텀 컬링을 연결했다. 생성·메시 잡은 종류별 `2w` in-flight를 지키되 같은 프레임에서 완료 잡을 다시 채워 프레임당 16개 처리량 하한을 없앴다. 빈 청크는 워커 슬롯을 쓰지 않는다.
+- 검증: `cargo test --all-targets` → 43 passed, `cargo clippy --all-targets -- -D warnings`와 `cargo fmt --check` 통과. `VF_RADIUS=12` Metal 실측은 `stream: settled in 2.85s (5000 chunks, 1820 GPU meshes)`로 3초 미만. 프러스텀 적용 뒤 실제 화면 `drawn`은 419. culled/greedy 스냅샷 `/tmp/vf_m4_culled_trees.png`, `/tmp/vf_m4_greedy_trees.png` 직접 확인: 픽셀 일치 99.967%, 정점 6,560,292 → 2,579,780(39.3%). `--edits`는 기준 이미지 대비 36,892픽셀 변경을 확인했다. 물리는 낙하·점프 높이·벽·저FPS 터널링·비행·수영 단위 테스트 통과.
+- 설계와 다르게 한 것 / 제안: 기능 계약 변경 없음. 제안: ROADMAP의 편집 스냅샷 명령은 현재 카메라 규약에서 `--yaw 3.1416`이면 편집물을 등지므로 시각 검증에는 `--yaw 0`이 맞다. 문서 소유자 리뷰 때 수정 권장.
+- 열린 문제: 자동 실행 중 게임 창이 뒤로 가면 Metal surface가 `Occluded`가 되어 해당 전환 프레임에 1104.9ms가 기록되고 이후 FPS 표본이 끊긴다. 정상 전면 구간은 max 21.6ms 이하였으나 M4의 60초 실제 비행·걷기 손 검증은 미실시. 업로드 원인 히치는 확인되지 않아 M5.3 아레나 조건은 충족하지 않은 것으로 처리한다.
+- 다음: 멈추지 않고 M5.1 저장 → M5.2 투명 패스. M5.3 아레나는 조건부 미구현을 최종 LOG에 기록.
+
 ## 2026-09-04 13:55  M3 종료 · M4/M5 설계 — Claude
 
 - 한 것: 진헌 손 플레이 통과(13:37) → **M3 종료**. M3.1은 GPT가 아직 시작하지 않았으므로 M4의 0단계로 흡수. BLUEPRINT **§14**(M4·M5 상세 설계) 추가: 워커 스레드 스트리밍(rayon + mpsc, 편집은 메인 동기), greedy(키 = tex+ao×4, 대각 뒤집기), 물리(Body/MoveInput, 1/120 substep, Y→X→Z 스윕), 나무(순수 `tree_at`/`tree_blocks`, 이웃 범위 ±2 열 스캔으로 경계 이어짐)·동굴(3D 노이즈 > 0.62, 8 ≤ y ≤ h−6), 프러스텀 컬링, 저장(수정 청크만 lz4 + world.json), 투명 패스(`translucent` 플래그, 같은 id 컬링, 물 윗면 비트 23, cull None, 뒤→앞), 아레나(조건부). ROADMAP M4(M4.0~M4.5)·M5(M5.1~M5.3) 재작성, 테스트 이름 20개, 검증 명령 포함.

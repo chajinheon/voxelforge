@@ -28,15 +28,13 @@ impl Camera {
 
     /// Builds the right-handed view matrix specified by the voxel coordinate
     /// convention.
-    #[allow(deprecated)]
     pub fn view(&self) -> Mat4 {
-        Mat4::look_to_rh(self.pos, self.forward(), Vec3::Y)
+        glam::camera::rh::view::look_to_mat4(self.pos, self.forward(), Vec3::Y)
     }
 
     /// Builds a depth-0..1 right-handed perspective projection.
-    #[allow(deprecated)]
     pub fn proj(&self, aspect: f32) -> Mat4 {
-        Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far)
+        glam::camera::rh::proj::directx::perspective(self.fov_y, aspect, self.near, self.far)
     }
 }
 

@@ -33,6 +33,7 @@ pub struct BlockDef {
     pub name: &'static str,
     pub solid: bool,
     pub opaque: bool,
+    pub translucent: bool,
     pub textures: [u16; 6],
 }
 
@@ -40,6 +41,7 @@ const AIR_DEF: BlockDef = BlockDef {
     name: "air",
     solid: false,
     opaque: false,
+    translucent: false,
     textures: [0; 6],
 };
 const DEFS: [BlockDef; 12] = [
@@ -48,66 +50,77 @@ const DEFS: [BlockDef; 12] = [
         name: "stone",
         solid: true,
         opaque: true,
+        translucent: false,
         textures: [0; 6],
     },
     BlockDef {
         name: "dirt",
         solid: true,
         opaque: true,
+        translucent: false,
         textures: [1; 6],
     },
     BlockDef {
         name: "grass",
         solid: true,
         opaque: true,
+        translucent: false,
         textures: [3, 3, 2, 1, 3, 3],
     },
     BlockDef {
         name: "sand",
         solid: true,
         opaque: true,
+        translucent: false,
         textures: [4; 6],
     },
     BlockDef {
         name: "water",
         solid: false,
         opaque: false,
+        translucent: true,
         textures: [5; 6],
     },
     BlockDef {
         name: "log",
         solid: true,
         opaque: true,
+        translucent: false,
         textures: [6, 6, 7, 7, 6, 6],
     },
     BlockDef {
         name: "leaves",
         solid: true,
         opaque: false,
+        translucent: false,
         textures: [8; 6],
     },
     BlockDef {
         name: "planks",
         solid: true,
         opaque: true,
+        translucent: false,
         textures: [9; 6],
     },
     BlockDef {
         name: "glass",
         solid: true,
         opaque: false,
+        translucent: true,
         textures: [10; 6],
     },
     BlockDef {
         name: "brick",
         solid: true,
         opaque: true,
+        translucent: false,
         textures: [11; 6],
     },
     BlockDef {
         name: "cobble",
         solid: true,
         opaque: true,
+        translucent: false,
         textures: [12; 6],
     },
 ];

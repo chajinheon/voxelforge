@@ -33,11 +33,15 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let z = (input.packed.x >> 12u) & 63u;
     let face = (input.packed.x >> 18u) & 7u;
     let ao = (input.packed.x >> 21u) & 3u;
+    let lowered = (input.packed.x & 0x00800000u) != 0u;
     let tex = input.packed.y & 65535u;
-    let light = (input.packed.y >> 16u) & 15u;
-    let sky = (input.packed.y >> 20u) & 15u;
+    // Packed light and sky channels are reserved for M6 lighting.
     let local = vec3<f32>(f32(x), f32(y), f32(z));
-    let world_pos = vec3<f32>(chunk.origin.xyz) + local;
+    var world_local = local;
+    if (lowered) {
+        world_local.y -= 0.125;
+    }
+    let world_pos = vec3<f32>(chunk.origin.xyz) + world_local;
 
     var uv = vec2<f32>(local.x, local.z);
     if (face == 0u || face == 1u) {
@@ -56,21 +60,19 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     } else if (face == 0u || face == 1u) {
         face_shade = 0.80;
     }
-    // M3 carries sky/light in the packed vertex for later lighting tiers.
-    let packed_light = f32(light + sky * 0u);
     let ao_factor = 0.35 + 0.65 * f32(ao) / 3.0;
 
     var output: VertexOutput;
     output.clip_position = globals.view_proj * vec4<f32>(world_pos, 1.0);
     output.uv = uv;
     output.tex = i32(tex);
-    output.shade = face_shade + packed_light * 0.0;
+    output.shade = face_shade;
     output.ao = ao_factor;
     return output;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let color = textureSample(block_tex, block_samp, input.uv, input.tex).rgb;
-    return vec4<f32>(color * input.shade * input.ao, 1.0);
+    let sampled = textureSample(block_tex, block_samp, input.uv, input.tex);
+    return vec4<f32>(sampled.rgb * input.shade * input.ao, sampled.a);
 }

@@ -1,18 +1,19 @@
 //! Windowed Voxelforge entrypoint for the M3 building milestone.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{IVec3, Vec3};
-use voxelforge::mesh::mesh_chunk;
 use voxelforge::player::camera::EYE_HEIGHT;
-use voxelforge::player::{Camera, Controller, place_rejected_inside_player_aabb};
-use voxelforge::render::{Globals, GpuChunk, Renderer};
+use voxelforge::player::{
+    Body, Camera, Controller, place_rejected_inside_player_aabb, safe_spawn, step,
+};
+use voxelforge::render::{Globals, GpuChunkMeshes, Renderer};
+use voxelforge::stream::Streamer;
 use voxelforge::world::block::{AIR, HOTBAR, WATER, def};
-use voxelforge::world::coords::{CHUNK_SIZE, WORLD_CHUNKS_Y, chunk_of};
-use voxelforge::world::r#gen::WorldGen;
+use voxelforge::world::coords::{WORLD_CHUNKS_Y, chunk_of};
 use voxelforge::world::raycast::{RayHit, raycast};
+use voxelforge::world::save::{PlayerMeta, SaveDir, WorldMeta};
 use voxelforge::world::world::World;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -20,15 +21,13 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
+mod app_config;
 mod window_gpu;
+use app_config::save_name;
 use window_gpu::WindowGpu;
 
 const WINDOW_WIDTH: f64 = 1280.0;
 const WINDOW_HEIGHT: f64 = 720.0;
-const STREAM_RADIUS: i32 = 6;
-const UNLOAD_RADIUS: i32 = STREAM_RADIUS + 2;
-const LOAD_BUDGET: usize = 4;
-const MESH_BUDGET: usize = 8;
 const DEFAULT_SEED: u64 = 1;
 const DEFAULT_YAW: f32 = 0.6;
 const DEFAULT_PITCH: f32 = -0.3;
@@ -39,16 +38,18 @@ const FAR: f32 = 1000.0;
 struct App {
     gpu: Option<WindowGpu>,
     world: World,
+    body: Body,
     camera: Camera,
     controller: Controller,
     renderer: Option<Renderer>,
-    chunks: Vec<GpuChunk>,
-    mesh_queue: HashMap<IVec3, bool>,
+    chunks: Vec<GpuChunkMeshes>,
+    streamer: Streamer,
     last_frame: Instant,
     started: Instant,
     title_at: Instant,
     title_frames: u32,
     title_max_ms: f64,
+    drawn_chunks: usize,
     cursor_locked: bool,
     selected_hotbar: usize,
     ray_hit: Option<RayHit>,
@@ -59,17 +60,41 @@ struct App {
 }
 
 impl App {
-    fn new(smoke_frames: Option<u32>) -> Self {
-        let world = World::new(DEFAULT_SEED);
-        let generator = WorldGen::new(DEFAULT_SEED);
+    fn new(smoke_frames: Option<u32>, save_dir: SaveDir) -> Self {
+        let saved_meta = match save_dir.read_meta() {
+            Ok(Some(meta)) if meta.version == 1 => Some(meta),
+            Ok(Some(meta)) => {
+                log::warn!(
+                    "unsupported world metadata version {}; using defaults",
+                    meta.version
+                );
+                None
+            }
+            Ok(None) => None,
+            Err(error) => {
+                log::warn!("read world metadata failed ({error:#}); using defaults");
+                None
+            }
+        };
+        let seed = saved_meta.as_ref().map_or(DEFAULT_SEED, |meta| meta.seed);
+        let world = World::new(seed);
+        let generator = world.generator().clone();
+        let spawn = safe_spawn(&generator);
+        let (body_pos, yaw, pitch, fly) =
+            saved_meta
+                .as_ref()
+                .map_or((spawn, DEFAULT_YAW, DEFAULT_PITCH, false), |meta| {
+                    (
+                        Vec3::from_array(meta.player.pos),
+                        meta.player.yaw,
+                        meta.player.pitch,
+                        meta.player.fly,
+                    )
+                });
         let camera = Camera {
-            pos: Vec3::new(
-                0.0,
-                generator.height_at(0, 0) as f32 + EYE_HEIGHT + 1.0,
-                0.0,
-            ),
-            yaw: DEFAULT_YAW,
-            pitch: DEFAULT_PITCH,
+            pos: body_pos + Vec3::Y * EYE_HEIGHT,
+            yaw,
+            pitch,
             fov_y: FOV_Y,
             near: NEAR,
             far: FAR,
@@ -78,16 +103,22 @@ impl App {
         Self {
             gpu: None,
             world,
+            body: Body {
+                pos: body_pos,
+                fly,
+                ..Body::default()
+            },
             camera,
             controller: Controller::new(),
             renderer: None,
             chunks: Vec::new(),
-            mesh_queue: HashMap::new(),
+            streamer: Streamer::new_with_save(save_dir),
             last_frame: now,
             started: now,
             title_at: now,
             title_frames: 0,
             title_max_ms: 0.0,
+            drawn_chunks: 0,
             cursor_locked: false,
             selected_hotbar: 0,
             ray_hit: None,
@@ -111,94 +142,35 @@ impl App {
 
     fn stream(&mut self) {
         let center = self.center_chunk();
-        let mut desired =
-            Vec::with_capacity(((STREAM_RADIUS * 2 + 1).pow(2) * WORLD_CHUNKS_Y) as usize);
-        for z in -STREAM_RADIUS..=STREAM_RADIUS {
-            for x in -STREAM_RADIUS..=STREAM_RADIUS {
-                for y in 0..WORLD_CHUNKS_Y {
-                    desired.push(IVec3::new(center.x + x, y, center.z + z));
-                }
-            }
-        }
-        desired.sort_by_key(|cp| {
-            let dx = cp.x - center.x;
-            let dz = cp.z - center.z;
-            (dx * dx + dz * dz, (cp.y - center.y).abs(), cp.y)
-        });
-        let mut loaded = 0;
-        for cp in desired {
-            if loaded == LOAD_BUDGET {
-                break;
-            }
-            if self.world.ensure_loaded(cp) {
-                loaded += 1;
-            }
-        }
-        self.world.unload_outside(center, UNLOAD_RADIUS);
-        self.remove_unloaded_gpu_chunks();
-        for cp in self.world.take_dirty() {
-            self.mesh_queue.entry(cp).or_insert(false);
-        }
-    }
-
-    fn remove_unloaded_gpu_chunks(&mut self) {
-        let mut kept = Vec::with_capacity(self.chunks.len());
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        for chunk in self.chunks.drain(..) {
-            let origin = chunk.origin;
-            let cp = IVec3::new(
-                origin.x / CHUNK_SIZE,
-                origin.y / CHUNK_SIZE,
-                origin.z / CHUNK_SIZE,
-            );
-            if self.world.chunk(cp).is_some() {
-                kept.push(chunk);
-            } else {
-                renderer.remove_chunk(chunk);
-            }
-        }
-        self.chunks = kept;
+        self.streamer.update(
+            &mut self.world,
+            renderer,
+            &mut self.chunks,
+            center,
+            self.drawn_chunks,
+        );
     }
 
-    fn mesh_some(&mut self) {
-        let mut pending: Vec<(IVec3, bool)> = self
-            .mesh_queue
-            .iter()
-            .map(|(&cp, &urgent)| (cp, urgent))
-            .collect();
-        let center = self.center_chunk();
-        pending.sort_by_key(|(cp, urgent)| {
-            let dx = cp.x - center.x;
-            let dy = cp.y - center.y;
-            let dz = cp.z - center.z;
-            (!urgent, dx * dx + dy * dy + dz * dz)
-        });
-        let Some(renderer) = self.renderer.as_mut() else {
+    fn save(&mut self) {
+        self.streamer.save_now(&mut self.world);
+        let Some(save) = self.streamer.save_dir() else {
             return;
         };
-        for (cp, _) in pending.into_iter().take(MESH_BUDGET) {
-            self.mesh_queue.remove(&cp);
-            if let Some(index) = self
-                .chunks
-                .iter()
-                .position(|chunk| chunk.origin == cp * CHUNK_SIZE)
-            {
-                let old = self.chunks.swap_remove(index);
-                renderer.remove_chunk(old);
-            }
-            if self.world.chunk(cp).is_none() {
-                continue;
-            }
-            let mesh = mesh_chunk(&self.world.padded(cp));
-            if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-                continue;
-            }
-            match renderer.upload_chunk(&mesh, cp * CHUNK_SIZE) {
-                Ok(chunk) => self.chunks.push(chunk),
-                Err(error) => log::error!("upload chunk {cp:?} failed: {error:#}"),
-            }
+        let meta = WorldMeta {
+            version: 1,
+            seed: self.world.seed(),
+            player: PlayerMeta {
+                pos: self.body.pos.to_array(),
+                yaw: self.camera.yaw,
+                pitch: self.camera.pitch,
+                fly: self.body.fly,
+            },
+        };
+        if let Err(error) = save.write_meta(&meta) {
+            log::error!("save world metadata failed: {error:#}");
         }
     }
 
@@ -231,8 +203,8 @@ impl App {
             self.camera.pos.y,
             self.camera.pos.z,
             self.world.chunk_count(),
-            self.chunks.len(),
-            self.mesh_queue.len(),
+            self.drawn_chunks,
+            self.streamer.queue_len(),
         );
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.set_title(&format!("voxelforge | {stats}"));
@@ -284,7 +256,7 @@ impl App {
         };
         if changed {
             for cp in self.world.take_dirty() {
-                self.mesh_queue.insert(cp, true);
+                self.streamer.mark_urgent(cp);
             }
         }
     }
@@ -321,9 +293,10 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
-        self.controller.update(&mut self.camera, dt);
+        let input = self.controller.update(&mut self.camera);
+        step(&self.world, &mut self.body, input, dt);
+        self.camera.pos = self.body.pos + Vec3::Y * EYE_HEIGHT;
         self.stream();
-        self.mesh_some();
         self.ray_hit = raycast(&self.world, self.camera.pos, self.camera.forward(), 6.0);
         let globals = self.globals();
         let rendered = match (self.gpu.as_ref(), self.renderer.as_mut()) {
@@ -333,16 +306,18 @@ impl App {
                 &self.chunks,
                 self.ray_hit.map(|hit| hit.block),
             ),
-            _ => false,
+            _ => None,
         };
         let frame_ms = now.elapsed().as_secs_f64() * 1000.0;
         self.title_max_ms = self.title_max_ms.max(frame_ms);
-        if rendered {
+        if let Some(drawn) = rendered {
+            self.drawn_chunks = drawn;
             self.title_frames = self.title_frames.saturating_add(1);
             self.frames = self.frames.saturating_add(1);
             if self.smoke_frames.is_some_and(|limit| self.frames >= limit) {
                 self.smoke_frames = None;
                 log::info!("smoke: rendered {} frames, exiting", self.frames);
+                self.save();
                 event_loop.exit();
                 return;
             }
@@ -385,6 +360,13 @@ impl ApplicationHandler for App {
         };
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
+        let center = self.center_chunk();
+        self.streamer.bootstrap(
+            &mut self.world,
+            self.renderer.as_mut().expect("renderer initialized"),
+            &mut self.chunks,
+            center,
+        );
         self.last_frame = Instant::now();
         if let Some(gpu) = self.gpu.as_ref() {
             gpu.window.request_redraw();
@@ -393,7 +375,10 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.save();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(size.width, size.height);
@@ -421,6 +406,7 @@ impl ApplicationHandler for App {
                     if self.cursor_locked {
                         self.unlock_cursor();
                     } else {
+                        self.save();
                         event_loop.exit();
                     }
                     return;
@@ -441,6 +427,16 @@ impl ApplicationHandler for App {
                             log::info!(
                                 "console stats: {}",
                                 if self.debug_stats { "on" } else { "off" }
+                            );
+                        }
+                        KeyCode::KeyF => {
+                            self.body.fly = !self.body.fly;
+                            if self.body.fly {
+                                self.body.vel.y = 0.0;
+                            }
+                            log::info!(
+                                "movement mode: {}",
+                                if self.body.fly { "fly" } else { "walk" }
                             );
                         }
                         _ => {}
@@ -489,9 +485,10 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0);
+    let save_dir = SaveDir::open(&save_name()?)?;
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(smoke_frames);
+    let mut app = App::new(smoke_frames, save_dir);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
