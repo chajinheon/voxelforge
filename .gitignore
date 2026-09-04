@@ -1,0 +1,5 @@
+/target
+/saves
+.DS_Store
+*.png
+!assets/textures/**/*.png

@@ -1,0 +1,29 @@
+[package]
+name = "voxelforge"
+version = "0.1.0"
+edition = "2024"
+description = "Minecraft-style voxel building game for macOS (Rust + wgpu/Metal)"
+
+# Debug builds: optimize dependencies fully and our code lightly so meshing
+# and world-gen are not 20x slower than release during development.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Keep symbols in release for profiling (Instruments / samply).
+[profile.release]
+debug = 1
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+env_logger = "0.11.11"
+fastnoise-lite = "1.1.1"
+glam = "0.33.6"
+image = "0.25.10"
+log = "0.4.34"
+pollster = "1.0.1"
+wgpu = "30.0.1"
+winit = "0.30"
