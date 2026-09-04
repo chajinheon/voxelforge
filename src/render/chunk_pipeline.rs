@@ -203,6 +203,14 @@ impl ChunkPipeline {
         &self.shader_path
     }
 
+    pub(crate) fn globals_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.globals_layout
+    }
+
+    pub(crate) fn globals_bind_group(&self) -> &wgpu::BindGroup {
+        &self.globals_bind_group
+    }
+
     pub fn update_globals(&self, queue: &wgpu::Queue, globals: &Globals) {
         globals.write(queue, &self.globals_buffer);
     }

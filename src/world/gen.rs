@@ -27,12 +27,18 @@ impl WorldGen {
     }
     pub fn generate(&self, cp: IVec3) -> Chunk {
         let mut chunk = Chunk::new_air();
+        let mut heights = [0; (CHUNK_SIZE * CHUNK_SIZE) as usize];
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let wx = cp.x * CHUNK_SIZE + x;
+                let wz = cp.z * CHUNK_SIZE + z;
+                heights[(x + CHUNK_SIZE * z) as usize] = self.height_at(wx, wz);
+            }
+        }
         for y in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
                 for x in 0..CHUNK_SIZE {
-                    let wx = cp.x * CHUNK_SIZE + x;
-                    let wz = cp.z * CHUNK_SIZE + z;
-                    let h = self.height_at(wx, wz);
+                    let h = heights[(x + CHUNK_SIZE * z) as usize];
                     let id = if y + cp.y * CHUNK_SIZE < 1 || y + cp.y * CHUNK_SIZE <= h - 4 {
                         STONE
                     } else if y + cp.y * CHUNK_SIZE < h {

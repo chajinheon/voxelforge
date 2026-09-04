@@ -2,6 +2,8 @@
 
 pub mod camera;
 pub mod controller;
+pub mod interaction;
 
 pub use camera::Camera;
 pub use controller::Controller;
+pub use interaction::place_rejected_inside_player_aabb;

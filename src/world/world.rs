@@ -39,25 +39,38 @@ impl World {
         let Some(chunk) = self.chunks.get_mut(&cp) else {
             return false;
         };
-        chunk.set(local_of(bp), id);
-        self.dirty.insert(cp);
         let local = local_of(bp);
-        for (axis, edge) in [
-            (0, local.x == 0 || local.x == 31),
-            (1, local.y == 0 || local.y == 31),
-            (2, local.z == 0 || local.z == 31),
+        chunk.set(local, id);
+        self.dirty.insert(cp);
+        for (axis, sign) in [
+            (
+                0,
+                (local.x == 0)
+                    .then_some(-1)
+                    .or_else(|| (local.x == 31).then_some(1)),
+            ),
+            (
+                1,
+                (local.y == 0)
+                    .then_some(-1)
+                    .or_else(|| (local.y == 31).then_some(1)),
+            ),
+            (
+                2,
+                (local.z == 0)
+                    .then_some(-1)
+                    .or_else(|| (local.z == 31).then_some(1)),
+            ),
         ] {
-            if edge {
-                for sign in [-1, 1] {
-                    let mut n = cp;
-                    match axis {
-                        0 => n.x += sign,
-                        1 => n.y += sign,
-                        _ => n.z += sign,
-                    }
-                    if self.chunks.contains_key(&n) {
-                        self.dirty.insert(n);
-                    }
+            if let Some(sign) = sign {
+                let mut n = cp;
+                match axis {
+                    0 => n.x += sign,
+                    1 => n.y += sign,
+                    _ => n.z += sign,
+                }
+                if self.chunks.contains_key(&n) {
+                    self.dirty.insert(n);
                 }
             }
         }
@@ -73,12 +86,54 @@ impl World {
     }
 
     pub fn padded(&self, cp: IVec3) -> PaddedChunk {
+        let mut chunks = [[[None; 3]; 3]; 3];
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    let neighbor = cp + IVec3::new(dx, dy, dz);
+                    if (0..WORLD_CHUNKS_Y).contains(&neighbor.y) {
+                        chunks[(dy + 1) as usize][(dz + 1) as usize][(dx + 1) as usize] =
+                            self.chunks.get(&neighbor);
+                    }
+                }
+            }
+        }
+
         let mut padded = PaddedChunk::new();
         for y in -1..=CHUNK_SIZE {
             for z in -1..=CHUNK_SIZE {
                 for x in -1..=CHUNK_SIZE {
                     let bp = cp * CHUNK_SIZE + IVec3::new(x, y, z);
-                    padded.set(x, y, z, self.get_block(bp));
+                    let id = if bp.y < 0 {
+                        STONE
+                    } else if bp.y >= CHUNK_SIZE * WORLD_CHUNKS_Y {
+                        AIR
+                    } else {
+                        let dx = (x == CHUNK_SIZE) as i32 - (x == -1) as i32;
+                        let dy = (y == CHUNK_SIZE) as i32 - (y == -1) as i32;
+                        let dz = (z == CHUNK_SIZE) as i32 - (z == -1) as i32;
+                        let local = IVec3::new(
+                            if dx == -1 {
+                                CHUNK_SIZE - 1
+                            } else {
+                                x & (CHUNK_SIZE - 1)
+                            },
+                            if dy == -1 {
+                                CHUNK_SIZE - 1
+                            } else {
+                                y & (CHUNK_SIZE - 1)
+                            },
+                            if dz == -1 {
+                                CHUNK_SIZE - 1
+                            } else {
+                                z & (CHUNK_SIZE - 1)
+                            },
+                        )
+                        .as_uvec3();
+                        chunks[(dy + 1) as usize][(dz + 1) as usize][(dx + 1) as usize]
+                            .map_or(AIR, |chunk| chunk.get(local))
+                    };
+                    padded.set(x, y, z, id);
                 }
             }
         }
@@ -149,7 +204,8 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::World;
-    use crate::world::coords::WORLD_CHUNKS_Y;
+    use crate::world::block::STONE;
+    use crate::world::coords::{CHUNK_SIZE, WORLD_CHUNKS_Y};
     use glam::IVec3;
 
     #[test]
@@ -177,5 +233,44 @@ mod tests {
         assert!(world.chunk(removed).is_some());
         assert!(!world.ensure_loaded(IVec3::new(0, WORLD_CHUNKS_Y, 0)));
         assert_eq!(world.chunk_count(), 2);
+    }
+
+    #[test]
+    fn set_block_marks_neighbor_dirty_on_border() {
+        let mut world = World::new(0);
+        let edited = IVec3::new(0, 0, 0);
+        let touched_neighbor = IVec3::new(-1, 0, 0);
+        let opposite_neighbor = IVec3::new(1, 0, 0);
+
+        assert!(world.ensure_loaded(edited));
+        assert!(world.ensure_loaded(touched_neighbor));
+        assert!(world.ensure_loaded(opposite_neighbor));
+        world.take_dirty();
+
+        assert!(world.set_block(edited * CHUNK_SIZE, STONE));
+
+        let dirty = world.take_dirty();
+        assert!(dirty.contains(&edited));
+        assert!(dirty.contains(&touched_neighbor));
+        assert!(!dirty.contains(&opposite_neighbor));
+    }
+
+    #[test]
+    fn padded_matches_world_lookup_at_vertical_boundaries() {
+        let mut world = World::new(0);
+        let cases = [IVec3::new(0, 0, 0), IVec3::new(0, WORLD_CHUNKS_Y - 1, 0)];
+
+        for cp in cases {
+            assert!(world.ensure_loaded(cp));
+            let padded = world.padded(cp);
+            for y in -1..=CHUNK_SIZE {
+                for z in -1..=CHUNK_SIZE {
+                    for x in -1..=CHUNK_SIZE {
+                        let bp = cp * CHUNK_SIZE + IVec3::new(x, y, z);
+                        assert_eq!(padded.get(x, y, z), world.get_block(bp));
+                    }
+                }
+            }
+        }
     }
 }

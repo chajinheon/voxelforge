@@ -1,22 +1,27 @@
-//! Windowed Voxelforge entrypoint for the M2 free-camera and streaming milestone.
+//! Windowed Voxelforge entrypoint for the M3 building milestone.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{IVec3, Vec3};
 use voxelforge::mesh::mesh_chunk;
 use voxelforge::player::camera::EYE_HEIGHT;
-use voxelforge::player::{Camera, Controller};
-use voxelforge::render::{Globals, Gpu, GpuChunk, Renderer};
+use voxelforge::player::{Camera, Controller, place_rejected_inside_player_aabb};
+use voxelforge::render::{Globals, GpuChunk, Renderer};
+use voxelforge::world::block::{AIR, HOTBAR, WATER, def};
 use voxelforge::world::coords::{CHUNK_SIZE, WORLD_CHUNKS_Y, chunk_of};
 use voxelforge::world::r#gen::WorldGen;
+use voxelforge::world::raycast::{RayHit, raycast};
 use voxelforge::world::world::World;
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, ElementState, WindowEvent};
+use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
+
+mod window_gpu;
+use window_gpu::WindowGpu;
 
 const WINDOW_WIDTH: f64 = 1280.0;
 const WINDOW_HEIGHT: f64 = 720.0;
@@ -31,104 +36,6 @@ const FOV_Y: f32 = 60.0_f32.to_radians();
 const NEAR: f32 = 0.05;
 const FAR: f32 = 1000.0;
 
-struct WindowGpu {
-    window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    depth: wgpu::Texture,
-    depth_view: wgpu::TextureView,
-}
-
-impl WindowGpu {
-    fn new(window: Arc<Window>) -> anyhow::Result<Self> {
-        let gpu = Gpu::new()?;
-        let surface = gpu.instance.create_surface(window.clone())?;
-        let size = window.inner_size();
-        let mut config = surface
-            .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
-            .ok_or_else(|| anyhow::anyhow!("surface is not supported by adapter"))?;
-        config.present_mode = wgpu::PresentMode::AutoVsync;
-        surface.configure(&gpu.device, &config);
-        log::info!(
-            "surface: {:?} {}x{} (scale {})",
-            config.format,
-            config.width,
-            config.height,
-            window.scale_factor()
-        );
-        let (depth, depth_view) = create_depth(&gpu.device, config.width, config.height);
-        Ok(Self {
-            window,
-            surface,
-            device: gpu.device,
-            queue: gpu.queue,
-            config,
-            depth,
-            depth_view,
-        })
-    }
-
-    fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        self.config.width = width;
-        self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
-        (self.depth, self.depth_view) = create_depth(&self.device, width, height);
-    }
-
-    fn render(&self, renderer: &mut Renderer, globals: &Globals, chunks: &[GpuChunk]) -> bool {
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                log::error!("surface validation error while acquiring frame");
-                return false;
-            }
-        };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        renderer.render(&view, &self.depth_view, globals, chunks);
-        self.window.pre_present_notify();
-        self.queue.present(frame);
-        true
-    }
-}
-
-fn create_depth(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    let depth = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("window-depth"),
-        size: wgpu::Extent3d {
-            width: width.max(1),
-            height: height.max(1),
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-    (depth, view)
-}
-
 struct App {
     gpu: Option<WindowGpu>,
     world: World,
@@ -136,13 +43,17 @@ struct App {
     controller: Controller,
     renderer: Option<Renderer>,
     chunks: Vec<GpuChunk>,
-    mesh_queue: HashSet<IVec3>,
+    mesh_queue: HashMap<IVec3, bool>,
     last_frame: Instant,
     started: Instant,
     title_at: Instant,
     title_frames: u32,
     title_max_ms: f64,
     cursor_locked: bool,
+    selected_hotbar: usize,
+    ray_hit: Option<RayHit>,
+    debug_stats: bool,
+    wheel_remainder: f64,
     frames: u32,
     smoke_frames: Option<u32>,
 }
@@ -171,13 +82,17 @@ impl App {
             controller: Controller::new(),
             renderer: None,
             chunks: Vec::new(),
-            mesh_queue: HashSet::new(),
+            mesh_queue: HashMap::new(),
             last_frame: now,
             started: now,
             title_at: now,
             title_frames: 0,
             title_max_ms: 0.0,
             cursor_locked: false,
+            selected_hotbar: 0,
+            ray_hit: None,
+            debug_stats: smoke_frames.is_some(),
+            wheel_remainder: 0.0,
             frames: 0,
             smoke_frames,
         }
@@ -221,7 +136,9 @@ impl App {
         }
         self.world.unload_outside(center, UNLOAD_RADIUS);
         self.remove_unloaded_gpu_chunks();
-        self.mesh_queue.extend(self.world.take_dirty());
+        for cp in self.world.take_dirty() {
+            self.mesh_queue.entry(cp).or_insert(false);
+        }
     }
 
     fn remove_unloaded_gpu_chunks(&mut self) {
@@ -246,18 +163,22 @@ impl App {
     }
 
     fn mesh_some(&mut self) {
-        let mut pending: Vec<IVec3> = self.mesh_queue.iter().copied().collect();
+        let mut pending: Vec<(IVec3, bool)> = self
+            .mesh_queue
+            .iter()
+            .map(|(&cp, &urgent)| (cp, urgent))
+            .collect();
         let center = self.center_chunk();
-        pending.sort_by_key(|cp| {
+        pending.sort_by_key(|(cp, urgent)| {
             let dx = cp.x - center.x;
             let dy = cp.y - center.y;
             let dz = cp.z - center.z;
-            dx * dx + dy * dy + dz * dz
+            (!urgent, dx * dx + dy * dy + dz * dz)
         });
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        for cp in pending.into_iter().take(MESH_BUDGET) {
+        for (cp, _) in pending.into_iter().take(MESH_BUDGET) {
             self.mesh_queue.remove(&cp);
             if let Some(index) = self
                 .chunks
@@ -302,22 +223,70 @@ impl App {
             return;
         }
         let fps = self.title_frames as f64 / elapsed.as_secs_f64();
+        let selected_name = def(HOTBAR[self.selected_hotbar]).name;
+        let stats = format!(
+            "{fps:.0} fps | max {:.1}ms | pos {:.1} {:.1} {:.1} | chunks {} drawn {} | meshq {} | selected {selected_name}",
+            self.title_max_ms,
+            self.camera.pos.x,
+            self.camera.pos.y,
+            self.camera.pos.z,
+            self.world.chunk_count(),
+            self.chunks.len(),
+            self.mesh_queue.len(),
+        );
         if let Some(gpu) = self.gpu.as_ref() {
-            gpu.window.set_title(&format!(
-                "voxelforge | {:.0} fps | max {:.1}ms | pos {:.1} {:.1} {:.1} | chunks {} drawn {} | meshq {}",
-                fps,
-                self.title_max_ms,
-                self.camera.pos.x,
-                self.camera.pos.y,
-                self.camera.pos.z,
-                self.world.chunk_count(),
-                self.chunks.len(),
-                self.mesh_queue.len()
-            ));
+            gpu.window.set_title(&format!("voxelforge | {stats}"));
+        }
+        if self.debug_stats {
+            log::info!("stats: {stats}");
         }
         self.title_at = Instant::now();
         self.title_frames = 0;
         self.title_max_ms = 0.0;
+    }
+
+    fn cycle_hotbar(&mut self, steps: i32) {
+        let count = HOTBAR.len() as i32;
+        self.selected_hotbar = (self.selected_hotbar as i32 + steps).rem_euclid(count) as usize;
+    }
+
+    fn scroll_hotbar(&mut self, delta: MouseScrollDelta) {
+        let amount = match delta {
+            MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+            MouseScrollDelta::PixelDelta(position) => position.y / 40.0,
+        };
+        self.wheel_remainder += amount;
+        let steps = self.wheel_remainder.trunc() as i32;
+        if steps != 0 {
+            self.wheel_remainder -= f64::from(steps);
+            self.cycle_hotbar(steps);
+        }
+    }
+
+    fn edit_with_button(&mut self, button: MouseButton) {
+        let Some(hit) = self.ray_hit else {
+            return;
+        };
+        let changed = match button {
+            MouseButton::Left => self.world.set_block(hit.block, AIR),
+            MouseButton::Right => {
+                let target = hit.block + hit.normal;
+                let target_id = self.world.get_block(target);
+                if (target_id == AIR || target_id == WATER)
+                    && !place_rejected_inside_player_aabb(target, self.camera.pos)
+                {
+                    self.world.set_block(target, HOTBAR[self.selected_hotbar])
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if changed {
+            for cp in self.world.take_dirty() {
+                self.mesh_queue.insert(cp, true);
+            }
+        }
     }
 
     fn unlock_cursor(&mut self) {
@@ -355,9 +324,15 @@ impl App {
         self.controller.update(&mut self.camera, dt);
         self.stream();
         self.mesh_some();
+        self.ray_hit = raycast(&self.world, self.camera.pos, self.camera.forward(), 6.0);
         let globals = self.globals();
         let rendered = match (self.gpu.as_ref(), self.renderer.as_mut()) {
-            (Some(gpu), Some(renderer)) => gpu.render(renderer, &globals, &self.chunks),
+            (Some(gpu), Some(renderer)) => gpu.render(
+                renderer,
+                &globals,
+                &self.chunks,
+                self.ray_hit.map(|hit| hit.block),
+            ),
             _ => false,
         };
         let frame_ms = now.elapsed().as_secs_f64() * 1000.0;
@@ -373,12 +348,6 @@ impl App {
             }
         }
         self.update_title();
-    }
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self::new(None)
     }
 }
 
@@ -433,8 +402,16 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => self.unlock_cursor(),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
+                button,
                 ..
-            } => self.lock_cursor(),
+            } => {
+                if !self.cursor_locked {
+                    self.lock_cursor();
+                } else {
+                    self.edit_with_button(button);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => self.scroll_hotbar(delta),
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
@@ -447,6 +424,27 @@ impl ApplicationHandler for App {
                         event_loop.exit();
                     }
                     return;
+                }
+                if pressed && !event.repeat {
+                    match code {
+                        KeyCode::Digit1 => self.selected_hotbar = 0,
+                        KeyCode::Digit2 => self.selected_hotbar = 1,
+                        KeyCode::Digit3 => self.selected_hotbar = 2,
+                        KeyCode::Digit4 => self.selected_hotbar = 3,
+                        KeyCode::Digit5 => self.selected_hotbar = 4,
+                        KeyCode::Digit6 => self.selected_hotbar = 5,
+                        KeyCode::Digit7 => self.selected_hotbar = 6,
+                        KeyCode::Digit8 => self.selected_hotbar = 7,
+                        KeyCode::Digit9 => self.selected_hotbar = 8,
+                        KeyCode::F3 => {
+                            self.debug_stats = !self.debug_stats;
+                            log::info!(
+                                "console stats: {}",
+                                if self.debug_stats { "on" } else { "off" }
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 if code == KeyCode::KeyR
                     && pressed
