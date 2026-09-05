@@ -13,6 +13,38 @@
 
 ---
 
+## 2026-09-05 11:58  M7~M10 중단 스냅샷 — Cursor Grok
+- 한 것: `870cd4c` 이후 미커밋 작업트리(140항목)와 `.omo` 중단 기록·증거를 커밋했다. GitHub 커넥터는 워킹트리 변경을 보지 못하므로, GPT Pro가 현재 소스·설계·핸드오프를 이어서 읽게 하기 위한 스냅샷이다.
+- 검증: 커밋만 수행. 컴파일·테스트·스냅샷은 실행하지 않음. 핸드오프 기준 트리는 `src/render/renderer/frame.rs` 모듈 경로 오류로 컴파일되지 않는다.
+- 설계와 다르게 한 것 / 제안: AGENTS.md의 「중간 커밋 금지」를 진헌 지시(커넥터 전달)로 예외. 리뷰 완료 커밋이 아니다.
+- 열린 문제: `.omo/HANDOFF_M7_M10_PAUSED.md`의 미완료 항목 그대로. M7 화이트아웃, 모듈 500줄, M10 shape/UI 계약, shaderpack live swap, M8/M9 fidelity, 최종 게이트 전부 미검증.
+- 다음: 원격에 올린 뒤 GPT Pro가 M10까지 구현을 이어간다. 검증 실행은 제외하고, 필요한 검증 선정은 GPT Pro에게 맡긴다.
+
+## 2026-09-05 01:05  M7.0 완료 — GPT-5.6 Sol
+
+- 만든 것: `SceneBindings` 한 벌이 opaque/translucent의 Globals·texture bind group·dynamic chunk-uniform arena를 공유하게 했고, 월드 청크마다 `ChunkSlot` 하나만 예약·해제한다. `RenderPreset::{Performance,Balanced,M5AirHigh,Cinematic}`과 높이 우선 8픽셀 정렬 내부 크기를 추가했다. `main`, `stream`, `world`, `snapshot`의 이벤트·스케줄링·테스트·인자 파서를 하위 모듈로 분리했다.
+- 변경 모듈과 줄 수: `render/chunk_pipeline.rs` 414, `render/renderer.rs` 404, `world/world.rs` 382, `app/mod.rs` 285, `stream.rs` 253, `bin/snapshot.rs` 282; 전부 500줄 이하.
+- 새 테스트와 전체 테스트 수: `m5_air_high_internal_size_is_1848x1040`; library 82 + snapshot 3 = 85 passed.
+- 실행한 명령: `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `git diff --check` 통과.
+- snapshot 경로와 픽셀 결과: 기준 `/tmp/vf_m7_baseline_final.png`, 리팩터 후 `/tmp/vf_m70_final.png`; exact 및 채널 임계값 2 일치율 모두 100%. M6 light probe `(209,140,92,59)` 유지.
+- CPU/GPU/메모리 수치: M6 기준선 사용; M7 신규 패스 없음.
+- wgpu 30 실제 API 확인: `wgpu-types-30.0.1/src/texture.rs`의 `TextureViewDescriptor` array/mip fields·`TextureViewDimension::D2Array`, `binding.rs`의 `BindingType::StorageTexture`, `features.rs`의 timestamp/storage feature, `wgpu-30.0.1/src/api/command_encoder.rs`의 `resolve_query_set`, `buffer.rs`의 `map_async`를 확인했다.
+- 의도한 커밋 메시지: `M7.0: consolidate renderer resources and presets`.
+- 다음 단계: M7.1 재질 배열·G-buffer·GGX PBR.
+- ADR 제안: 없음.
+
+## 2026-09-05 00:00  M7~M10 시작 — GPT-5.6 Sol
+
+- 한 것: Sol M7→M10 무중단 실행 시작. 첨부 설계 패키지를 구현 사양으로 채택하고 현재 M6 커밋과 모듈 경계를 확인했다.
+- base HEAD: `870cd4cc4be61b652767588293fda890edd168a6`
+- M6 tests: 84 passed.
+- M6 settled/perf: Apple M5 release R=12, 5000 chunks `settled in 3.39s`; lighting p95 2.98ms; steady max 18.8ms.
+- 설계 우선순위: `BLUEPRINT §20`.
+- 중간 리뷰 대기: 없음.
+- 최종 정지: M10 이후.
+- 의도한 커밋 메시지: 없음(연속 구현 시작 기록).
+- 다음: M7.0 M6 기준선 재검증과 renderer resource ownership 통합.
+
 ## 2026-09-04 23:25  M6.4 — GPT-5.6 Sol
 
 - 한 것: `snapshot`에 `terrain|m6-light-room|m6-wind`, `final|light`, `--day-phase`, `--world-time`을 연결하고 모든 fixture를 동기 열 조명 뒤 메싱하도록 바꿨다. `light` 파이프라인은 텍스처·AO·면 음영을 우회해 opaque와 translucent의 선형 illumination을 출력한다. 밀폐 조명방·바람 fixture, VFC1 재조명 저장 회귀, 실제 메시를 그리는 final/light transactional shader hotreload 회귀를 추가했다. 비동기 조명은 stale/outside 결과를 통계에서 제외하고 current/next wave 중복을 합쳐 경계 재계산을 줄였다.

@@ -307,307 +307,171 @@ grep -E "settled|lighting:|stats:" /tmp/vf_m6_perf.log
 
 ---
 
-## M7 — HDR·디퍼드·그림자·SSAO·대기·후처리
+## M7~M10 공통 실행 규칙 — M6 리뷰 이후 무중단 구간
 
-설계는 BLUEPRINT §16이다.
+M6는 리뷰·커밋 완료 상태다. M7부터 M10까지는 하나의 연속 작업이다.
 
-**M7.0 공유 리소스·arena 게이트**
+- M7, M8, M9가 끝날 때마다 해당 완료 조건을 전부 통과하고 `docs/LOG.md` 맨 위에 기록한다.
+- 그 시점에 사람 리뷰를 요청하거나 멈추지 않는다. 즉시 다음 마일스톤으로 간다.
+- Sol은 `git commit`을 실행하지 않는다. 각 단계 LOG에 아래 「의도한 커밋 메시지」만 적는다.
+- 검증 실패를 「후속 리뷰 사항」으로 미루지 않는다. 같은 단계에서 수정·재검증한다.
+- wgpu 30 API가 §11에 없으면 코드를 쓰기 전에 registry source에서 실제 타입·필드를 확인하고 확인 경로를 LOG에 남긴다.
+- M10 최종 검증 뒤에만 멈추고 `M7~M10 완료, 최종 리뷰 요청`이라고 보고한다.
 
-만드는 것:
-
-* `SceneBindings`.
-* opaque/translucent Globals와 청크 uniform arena 통합.
-* 월드 청크당 `ChunkSlot` 하나.
-* M5에서 이월한 VB/IB arena 측정 게이트.
-* 기존 render 결과가 리팩터 전과 99.5% 이상 일치하는 회귀 snapshot.
-
-커밋 메시지: `M7.0: consolidate scene GPU resources`
-
-완료 조건:
-
-* opaque/translucent Globals buffer 한 벌.
-* 청크 uniform arena 4MiB 한 벌.
-* 같은 청크 두 패스가 같은 dynamic offset.
-* `VF_AUTOPILOT=stream VF_BENCH_FRAMES=3600` 수치로 arena 여부 자동 결정.
-* 선택 이유와 p99 frame/upload를 LOG에 기록.
-* arena를 만들었다면 §14.10 테스트 2개 통과.
-
-**M7.1 타깃·G버퍼·렌더 스케일·debug view**
-
-만드는 것:
-
-* `SceneTargets`.
-* G버퍼 3장, depth, HDR, native LDR.
-* `Renderer::render_frame`.
-* surface direct geometry 제거.
-* render scale 0.5~1.0.
-* F4와 `--view`.
-* M7 Globals 확장.
-* `MaterialGpu`.
-
-커밋 메시지: `M7.1: add scaled HDR gbuffer`
-
-완료 조건:
-
-* 모든 texture format가 §16.2.4와 일치.
-* 2560×1440 scale 0.75 → internal 1920×1080.
-* 1280×720 scale 0.5 → internal 640×360.
-* output PNG 크기는 항상 요청한 native 크기.
-* `albedo|normal|depth|ao|shadow|light|final` parse·cycle.
-* normal·depth 프로브 §16.6 통과.
-
-**M7.2 CSM**
-
-만드는 것:
-
-* 3-cascade PSSM.
-* 2048² `Depth32Float` array.
-* stable texel snapping.
-* 3×3 PCF·bias·cascade blend.
-* alpha-cutout·바람 shadow.
-* 야간 shadow skip.
-
-커밋 메시지: `M7.2: add cascaded sun shadows`
-
-완료 조건:
-
-* split `[22.9206, 52.7755, 192.0]` 오차 `<1e-3`.
-* sub-texel 카메라 이동 matrix bitwise 동일.
-* shadow/lit probe 각각 ≤0.35, ≥0.90.
-* cascade 경계 밝기 점프 ≤0.12.
-* shadow GPU p95 ≤1.8ms.
-
-**M7.3 SSAO·deferred·대기 하늘**
-
-만드는 것:
-
-* 16-sample half-res SSAO.
-* 5×5 bilateral blur.
-* deferred lighting.
-* 256×128 Rayleigh–Mie LUT.
-* 태양·달.
-* LEAVES alpha-cutout.
-
-커밋 메시지: `M7.3: add deferred lighting atmosphere and ssao`
-
-완료 조건:
-
-* AO open ≥0.90, corner ≤0.65.
-* depth edge 반대편 AO 누출 ≤0.05.
-* sky LUT NaN·Inf 0.
-* leaves alpha coverage 65~75%.
-* transparent 전까지 HDR finite.
-* SSAO p95 ≤0.9ms, sky+deferred ≤1.3ms.
-
-**M7.4 블룸·노출·ACES·업스케일**
-
-만드는 것:
-
-* 5단계 bloom.
-* 평균 log luminance reduction.
-* exposure adaptation.
-* ACES fitted.
-* Catmull–Rom native upscale.
-* snapshot warmup/frames/fixed exposure.
-
-커밋 메시지: `M7.4: add HDR post processing`
-
-완료 조건:
-
-* bloom 5단계 크기 정확.
-* halo/far 밝기 ≥1.20.
-* 자동 노출 두 fixture 회색 패치 0.12~0.24.
-* ACES CPU 참조 오차 `<1e-5`.
-* scale 0.5 출력에 검은 border 없음.
-* bloom+exposure+tone/upscale p95 ≤1.9ms.
-
-**M7.5 forward 통합·timings·마감**
-
-만드는 것:
-
-* WATER/GLASS HDR forward.
-* outline HDR.
-* timestamp JSON.
-* 모든 shader transactional hotreload.
-* M7 fixture.
-* 전체 성능·LOG.
-
-커밋 메시지: `M7.5: complete deferred renderer`
-
-완료 조건:
-
-* 물·유리 뒤 지형이 보임.
-* forward depth write off.
-* surface에는 present pass만 접근.
-* GPU timings JSON 키 10개 존재.
-* 전체 테스트 **≥90 passed**.
-* render scale 0.75 전체 p95 ≤13.0ms.
-* max `<25ms`.
-* clippy/fmt/diff 통과.
-
-검증:
-
-```bash
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all -- --check
-git diff --check
-
-for v in albedo normal depth ao shadow light final; do
-  cargo run --release --bin snapshot -- \
-    --fixture m7-passes --size 640x360 --render-scale 1.0 \
-    --day-phase 0.0 --fixed-exposure 1.0 \
-    --view "$v" --out "/tmp/vf_m7_${v}.png"
-done
-
-cargo run --release --bin snapshot -- \
-  --fixture m7-bloom --size 640x360 \
-  --fixed-exposure 1.0 --out /tmp/vf_m7_bloom.png
-
-cargo run --release --bin snapshot -- \
-  --fixture m7-exposure-dark --size 640x360 \
-  --auto-exposure on --warmup 180 \
-  --out /tmp/vf_m7_exposure_dark.png
-
-cargo run --release --bin snapshot -- \
-  --fixture m7-passes --size 2560x1440 --render-scale 0.75 \
-  --warmup 60 --frames 180 \
-  --timings /tmp/vf_m7_timings.json \
-  --out /tmp/vf_m7_perf.png
-
-python3 - <<'PY'
-import json
-d=json.load(open("/tmp/vf_m7_timings.json"))
-required=["shadow","gbuffer","ssao","sky","deferred","translucent",
-          "bloom","exposure","tonemap_upscale","present","total_gpu"]
-for k in required:
-    assert k in d, k
-assert d["shadow"]["p95_ms"] <= 1.8
-assert d["gbuffer"]["p95_ms"] <= 1.6
-assert d["ssao"]["p95_ms"] <= 0.9
-assert d["total_gpu"]["p95_ms"] <= 8.4
-PY
-```
-
-BLUEPRINT §16.6의 픽셀 판정을 모두 실행한다.
-
-**M7가 끝나면 멈춘다.** LOG에 `M7 완료, 리뷰 요청`. Claude 리뷰·커밋 전에는 M8로 가지 않는다.
+설계 우선순위는 BLUEPRINT §20이다. §16~§19와 충돌하면 §20을 따른다.
 
 ---
 
-## M8 — 물·볼류메트릭·구름·LOD
+## M7 — M5 Air High HDR·PBR·GTAO·TAAU 기반 렌더러
 
-설계는 BLUEPRINT §17이다.
-
-**M8.1 WATER 메시·Gerstner**
+### M7.0 — M6 기준선·공유 GPU 리소스·모듈 분리
 
 만드는 것:
 
-* `ChunkMeshes.water`.
-* WATER와 GLASS 분리.
-* water surface greedy 2×2.
-* 네 Gerstner wave와 analytic normal.
-* side top seam.
+- M6 HEAD에서 전체 테스트와 기준 snapshot 재생성.
+- `SceneBindings`: Globals, material arrays, sampler, material LUT, 청크 dynamic-offset uniform arena 한 벌.
+- opaque/translucent가 중복 소유하던 Globals·청크 uniform 제거.
+- `renderer.rs`, `main.rs`, `stream.rs`를 500줄 아래로 유지하도록 하위 모듈 분리.
+- `RenderPreset::{Performance,Balanced,M5AirHigh,Cinematic}`와 내부 크기 계산.
+- wgpu 30 texture array, storage texture, timestamp, query resolve, texture view layer API 사전 확인.
 
-커밋 메시지: `M8.1: add animated water surface`
+의도한 커밋 메시지:
+
+```text
+M7.0: consolidate renderer resources and presets
+```
 
 완료 조건:
 
-* 최대 Y 변위 ≤0.149001.
-* water top quad 최대 2×2.
-* 청크 경계 같은 정점 위치 오차 `<1e-5`.
-* 기존 lowered bit 23 유지.
-* 물 이외 정점은 시간에 따라 움직이지 않음.
+- `m5_air_high`, 2560×1440 내부 크기 정확히 1848×1040.
+- opaque·translucent가 같은 Globals buffer ID와 같은 chunk-uniform arena ID 사용.
+- 한 월드 청크는 `ChunkSlot` 하나만 사용.
+- 현재 M6 final snapshot과 리팩터 후 snapshot의 동일 crop 픽셀 일치율 ≥99.5%, 임계값 채널당 2.
+- `main.rs`, `stream.rs`, `renderer.rs` 각각 500줄 이하.
+- 렌더 루프 `unwrap/expect` 0개.
+- LOG에 wgpu 30 확인한 파일 경로·실제 이름 기록.
 
-**M8.2 SSR·굴절·코스틱**
+### M7.1 — 재질 배열·mip·G버퍼·PBR
 
 만드는 것:
 
-* HDR scene copy.
-* transparent 통합 거리 정렬.
-* 48-step SSR, 5-step refine.
-* depth-aware refraction.
-* Beer–Lambert.
-* Fresnel·screen-space caustics.
+- albedo/material/emission 16×16 `texture_2d_array` 3개, 5 mip.
+- coverage-preserving cutout mip.
+- `MaterialGpu`, POM CPU 참조, tangent basis.
+- G버퍼 5장 + depth.
+- motion vector에서 jitter 제거.
+- Cook–Torrance GGX deferred PBR.
+- 64² sky cubemap 7 mip.
+- debug view `albedo|normal|depth|light|material|motion|reactive`.
 
-커밋 메시지: `M8.2: add reflective refractive water`
+의도한 커밋 메시지:
+
+```text
+M7.1: add material arrays gbuffer and ggx lighting
+```
 
 완료 조건:
 
-* SSR miss는 sky fallback.
-* foreground refraction reject.
-* thickness 증가 시 RGB 투과율 단조 감소.
-* water debug RGB가 모두 0..1.
-* 물 시간차 crop 변경률 1~35%.
-* static crop 변경률 ≤0.2%.
-* water GPU p95 ≤1.3ms.
+- 세 배열의 layer 수·이름·mip 수가 동일.
+- cutout 각 mip coverage 차이 ≤3%p.
+- oct normal roundtrip 최대 각도 오차 <0.25°.
+- POM CPU reference와 shader probe UV 오차 ≤1/1024.
+- GGX 테스트에서 NaN/Inf 0, BRDF energy upper bound 1.05.
+- motion vector static camera+jitter-only 장면의 절댓값 ≤1e-5.
+- `m7-materials` fixture의 metal/stone/roughness/emissive 픽셀 조건 통과.
+- G-buffer+deferred GPU p95 합 ≤2.95ms.
 
-**M8.3 볼류메트릭 fog/light**
+### M7.2 — CSM·contact shadow·GTAO·대기
 
 만드는 것:
 
-* 64² blue-noise.
-* 1/4해상도 40-step fog.
-* CSM ray sample.
-* HG phase.
-* temporal reprojection·bilateral upsample.
+- 3 cascade PSSM, preset별 far.
+- 8/12/20 tap rotated Poisson PCF.
+- cascade update cadence와 edit invalidation.
+- half-res 8-step contact shadow.
+- half-res XeGTAO 계열 horizon search, temporal·bilateral.
+- transmittance 256×64, multiscatter 32×32, sky-view 192×108 LUT.
+- sky cubemap update cadence.
+- LEAVES alpha-cutout과 shadow alpha test.
 
-커밋 메시지: `M8.3: add volumetric fog and light`
+의도한 커밋 메시지:
+
+```text
+M7.2: add high quality shadows gtao and atmosphere
+```
 
 완료 조건:
 
-* zero density 결과 `(rgb=0, transmittance=1)`.
-* disocclusion history reject.
-* godray beam/shadow 밝기 비 ≥1.50.
-* p95 ≤1.2ms.
+- PSSM split CPU reference 오차 <1e-3.
+- cascade0 매 frame, cascade1 2-frame, cascade2 4-frame cadence 테스트.
+- camera threshold/edit에서 즉시 update.
+- flat plane GTAO ≥0.92, right-angle corner ≤0.62.
+- depth edge 반대편 AO 누출 ≤0.05.
+- shadow fixture: umbra ≤0.30, lit ≥0.90, cascade seam jump ≤0.10.
+- 모든 atmosphere texel finite·0 이상.
+- sky LUT/cubemap 불필요 update가 안정 camera 64 frame 중 8회 이하.
+- shadow+contact p95 ≤2.00ms, GTAO ≤0.90ms, atmosphere 상각 ≤0.20ms.
 
-**M8.4 볼류메트릭 구름**
+### M7.3 — 블룸·노출·TAAU·ACES·샤픈
 
 만드는 것:
 
-* periodic Perlin·Worley.
-* 128³ base, 32³ detail.
-* 180~260 layer.
-* 48 view·6 light step.
-* temporal.
+- 6-level internal bloom.
+- average log luminance reduction, exposure adaptation.
+- native `Rgba16Float` TAAU history ping-pong.
+- 8-frame Halton jitter.
+- motion/depth/normal/material/reactive reject.
+- YCoCg 3×3 variance clamp.
+- ACES fitted·색 보정·5-tap sharpen.
+- resize/scale/FOV/teleport/shaderpack history reset.
 
-커밋 메시지: `M8.4: add volumetric clouds`
+의도한 커밋 메시지:
+
+```text
+M7.3: add taau exposure bloom and final grading
+```
 
 완료 조건:
 
-* 반대 texture face 차이 `<1e-6`.
-* layer 밖 density 0.
-* cloud debug coverage 20~75%.
-* 고정 카메라 warmup 32 뒤 프레임간 평균 차이 ≤0.02.
-* p95 ≤1.3ms.
+- Halton 8개 값 계약과 bitwise 동일.
+- disocclusion pixel history weight 0.
+- static 장면 warmup32 high-frequency residual ≤warmup1의 70%.
+- native edge rise width ≤3.0px.
+- render scale 0.72 출력 크기는 정확히 native, border black 비율 <0.5%.
+- auto exposure 30/60/120fps 2초 결과 상대 오차 <0.5%.
+- bloom halo/far 선형 밝기 비 ≥1.20.
+- TAAU+ACES+sharpen p95 ≤1.10ms.
 
-**M8.5 원거리 LOD**
+### M7.4 — M7 통합·회귀·성능 게이트
 
 만드는 것:
 
-* LOD1~3 grid·재귀 mode.
-* coarse 조명.
-* worker cache.
-* dynamic uniform `origin.w=lod_shift`.
-* dither overlap·skirt.
-* save/WorldGen source 우선순위.
-* memory cap.
+- surface direct geometry 제거, caller output view에는 present copy만.
+- F4 debug cycle 확정.
+- transactional shader hotreload 전체 파이프라인 묶음.
+- timestamp timing JSON.
+- M6 조명·투명·outline 회귀.
+- M7 LOG 수치 기록.
 
-커밋 메시지: `M8.5: add hierarchical terrain lod`
+의도한 커밋 메시지:
+
+```text
+M7.4: complete m5 air high renderer foundation
+```
 
 완료 조건:
 
-* level 1/2/3 셀 크기 2/4/8.
-* 기본 ring 거리 §17.2.10 정확.
-* near crop LOD on/off 99.0% 일치.
-* ring 밝기 점프 ≤0.08.
-* CPU LOD cache ≤128MiB.
-* GPU LOD mesh ≤128MiB.
-* 전체 테스트 **≥111 passed**.
-* 전체 프레임 p95 ≤16.0ms.
-* clippy/fmt/diff 통과.
+- 전체 테스트 ≥95 passed.
+- `cargo clippy --all-targets -- -D warnings` 통과.
+- `cargo fmt --all -- --check` 통과.
+- `git diff --check` 통과.
+- M7 GPU p95 ≤8.10ms.
+- `VF_ALLOC_STATS=1` steady renderer allocation 중앙값 0, p95 0/frame.
+- 전체 frame p95 ≤12.5ms, max <25ms.
+- shader 한 개 문법 오류를 넣은 smoke에서 이전 pipeline 유지, panic 0.
+- M6 `m6-light-room`, `m6-wind` 픽셀 판정 재통과.
 
-검증:
+검증 명령:
 
 ```bash
 cargo test --all-targets
@@ -616,133 +480,345 @@ cargo fmt --all -- --check
 git diff --check
 
 cargo run --release --bin snapshot -- \
-  --fixture m8-water --size 640x360 --world-time 0.0 \
-  --fixed-exposure 1.0 --out /tmp/vf_m8_water_a.png
+  --fixture m7-materials --size 1280x720 --render-scale 1.0 \
+  --preset m5_air_high --fixed-exposure 1.0 --warmup 16 \
+  --view final --out /tmp/vf_m7_materials.png
 
 cargo run --release --bin snapshot -- \
-  --fixture m8-water --size 640x360 --world-time 1.0 \
-  --fixed-exposure 1.0 --out /tmp/vf_m8_water_b.png
+  --fixture m7-taau --size 1280x720 --render-scale 0.72 \
+  --preset m5_air_high --fixed-exposure 1.0 --warmup 1 \
+  --out /tmp/vf_m7_taau_1.png
+cargo run --release --bin snapshot -- \
+  --fixture m7-taau --size 1280x720 --render-scale 0.72 \
+  --preset m5_air_high --fixed-exposure 1.0 --warmup 32 \
+  --out /tmp/vf_m7_taau_32.png
 
 cargo run --release --bin snapshot -- \
-  --fixture m8-godrays --size 640x360 --warmup 32 \
-  --fixed-exposure 1.0 --out /tmp/vf_m8_godrays.png
+  --fixture m7-passes --size 2560x1440 --render-scale 0.72 \
+  --preset m5_air_high --warmup 60 --frames 240 \
+  --timings /tmp/vf_m7_timings.json \
+  --out /tmp/vf_m7_perf.png
+```
+
+M7 검증이 통과하면 LOG에 `M7 검증 완료 — 무중단 규칙에 따라 M8 진행`을 적고 **멈추지 말고 M8.0으로 간다.**
+
+---
+
+## M8 — 고품질 물·볼류메트릭·구름·LOD
+
+### M8.0 — depth pyramid·공통 temporal 기반
+
+만드는 것:
+
+- linear depth `R32Float` mip chain.
+- 64² deterministic blue-noise rank texture.
+- quarter-resolution checkerboard 좌표·history reset 공통 코드.
+- temporal reject 공통 함수의 Rust reference.
+
+의도한 커밋 메시지:
+
+```text
+M8.0: add temporal and depth hierarchy foundations
+```
+
+완료 조건:
+
+- mip0 linear depth CPU reference 오차 <1e-4.
+- 각 상위 mip이 2×2 min depth와 정확히 일치.
+- blue-noise rank가 0..4095 순열, 동일 seed bitwise 동일.
+- 4-frame checkerboard가 모든 parity를 한 번씩 방문.
+
+### M8.1 — WATER mesh·Gerstner·SSR·굴절
+
+만드는 것:
+
+- WATER를 GLASS와 별도 mesh/pass로 분리.
+- water surface greedy 최대 2×2.
+- 네 Gerstner wave와 analytic normal.
+- hierarchical SSR 40+5.
+- Fresnel, Beer–Lambert, depth-aware refraction.
+- shoreline/crest foam, caustics, underwater mode.
+
+의도한 커밋 메시지:
+
+```text
+M8.1: add high quality animated water
+```
+
+완료 조건:
+
+- Y 변위 절댓값 ≤0.149001.
+- analytic normal 길이 오차 <1e-4.
+- adjacent chunk water vertex 위치 차이 <1e-5.
+- foreground refraction은 원 UV 사용.
+- thickness 증가 시 RGB transmittance 단조 감소.
+- SSR debug confidence 0..1, residual miss 정확.
+- water crop 시간 변경률 1~35%, static crop ≤0.2%.
+- water p95 ≤1.20ms.
+
+### M8.2 — 볼류메트릭 포그·라이트
+
+만드는 것:
+
+- quarter-res 2×2 checkerboard 32-step march.
+- HG phase, CSM 2-step cadence sample.
+- closest 8 emissive light fog contribution.
+- temporal reprojection·depth/normal reject·bilateral upscale.
+- underwater density 3배.
+
+의도한 커밋 메시지:
+
+```text
+M8.2: add temporal volumetric lighting and fog
+```
+
+완료 조건:
+
+- zero density `(rgb=0,a=1)`.
+- disocclusion history weight 0.
+- 4-frame static convergence 후 frame difference ≤0.02.
+- godray beam/shadow brightness ratio ≥1.50.
+- light list는 거리 오름차순+position tie-break로 결정적.
+- p95 ≤0.85ms.
+
+### M8.3 — 볼류메트릭 구름·cloud shadow
+
+만드는 것:
+
+- periodic 128³ base/32³ detail Perlin–Worley.
+- 180~260 cloud layer.
+- quarter-res checkerboard 40/6 march.
+- 512² world-space cloud shadow, 8-frame cadence.
+- cloud/fog composition order.
+
+의도한 커밋 메시지:
+
+```text
+M8.3: add volumetric clouds and cloud shadows
+```
+
+완료 조건:
+
+- periodic opposite faces 최대 차이 <1e-6.
+- layer 밖 density 0.
+- cloud coverage 20~75%.
+- cloud shadow origin은 32블록 단위 snap.
+- 안정 camera 64 frame에서 shadow update ≤8회.
+- direct-light clouded/open ratio 0.55~0.90.
+- clouds p95 ≤1.05ms, cloud shadow 상각 ≤0.15ms.
+
+### M8.4 — LOD1/2/3
+
+만드는 것:
+
+- 2×/4×/8× 32³ grids.
+- deterministic modal downsample.
+- coarse M6 light.
+- 32-block overlap dither와 coarse skirt.
+- source priority World→save→WorldGen.
+- edit ancestor invalidation.
+- CPU/GPU cache caps.
+
+의도한 커밋 메시지:
+
+```text
+M8.4: add hierarchical distant terrain lod
+```
+
+완료 조건:
+
+- level cell size 2/4/8.
+- default R=10 ring 범위 §17/§20과 정확히 일치.
+- near crop LOD on/off ≥99.0% 픽셀 일치.
+- ring brightness seam ≤0.08.
+- CPU LOD cache ≤128MiB, GPU LOD mesh ≤128MiB.
+- LOD draw p95 ≤0.45ms.
+
+### M8.5 — M8 통합·성능
+
+만드는 것:
+
+- GLASS/WATER를 청크 중심 거리 기준 뒤→앞으로 하나의 목록에서 정렬하고 pipeline만 전환한다.
+- underwater hand/UI 제외 확인.
+- debug `water|volumetric|cloud|lod`.
+- M8 timing JSON·snapshot probes·LOG.
+
+의도한 커밋 메시지:
+
+```text
+M8.5: complete water volumetrics clouds and lod
+```
+
+완료 조건:
+
+- 전체 테스트 ≥118 passed.
+- M7 회귀 전부 통과.
+- M8 추가 GPU p95 ≤3.70ms.
+- M7+M8 GPU p95 ≤11.8ms.
+- 전체 frame p95 ≤15.0ms, max <25ms.
+- clippy/fmt/diff 통과.
+
+검증 명령:
+
+```bash
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
 
 cargo run --release --bin snapshot -- \
-  --fixture m8-clouds --size 640x360 --warmup 32 \
-  --view cloud --out /tmp/vf_m8_cloud.png
+  --fixture m8-water --size 1280x720 --preset m5_air_high \
+  --world-time 0.0 --fixed-exposure 1.0 --out /tmp/vf_m8_water_a.png
+cargo run --release --bin snapshot -- \
+  --fixture m8-water --size 1280x720 --preset m5_air_high \
+  --world-time 1.0 --fixed-exposure 1.0 --out /tmp/vf_m8_water_b.png
 
 cargo run --release --bin snapshot -- \
-  --fixture m8-lod --size 1280x720 --view lod \
-  --out /tmp/vf_m8_lod_debug.png
+  --fixture m8-godrays --size 1280x720 --preset m5_air_high \
+  --warmup 32 --fixed-exposure 1.0 --out /tmp/vf_m8_godrays.png
 
 cargo run --release --bin snapshot -- \
-  --fixture m8-lod --size 2560x1440 --render-scale 0.75 \
-  --warmup 60 --frames 180 \
-  --timings /tmp/vf_m8_timings.json \
+  --fixture m8-clouds --size 1280x720 --preset m5_air_high \
+  --warmup 32 --view cloud --out /tmp/vf_m8_clouds.png
+
+cargo run --release --bin snapshot -- \
+  --fixture m8-lod --size 2560x1440 --preset m5_air_high \
+  --warmup 60 --frames 240 --timings /tmp/vf_m8_timings.json \
   --out /tmp/vf_m8_perf.png
 ```
 
-BLUEPRINT §17.6의 픽셀 판정을 모두 실행한다.
-
-**M8 뒤에는 멈추지 않는다.** LOG에 M8 단계별 기록을 남기고 바로 M9.1로 간다. M8 단독 리뷰 요청을 하지 않는다.
+M8 검증이 통과하면 LOG에 `M8 검증 완료 — 무중단 규칙에 따라 M9 진행`을 적고 **멈추지 말고 M9.0으로 간다.**
 
 ---
 
 ## M9 — 컴퓨트 DDA 복셀 GI
 
-설계는 BLUEPRINT §18이다.
-
-**M9.1 Clipmap**
+### M9.0 — 기능 지원 확인·폴백 틀
 
 만드는 것:
 
-* 128³×4 level.
-* material/light RGB textures.
-* World·LOD voxelize.
-* 토로이달 origin·ring offset.
-* slab update·4MiB/frame.
-* edit invalidation.
-* allocation 실패 폴백.
+- 3D `Rgba8Unorm` sample/storage/copy capability 실제 확인.
+- `GiMode::{Enabled,Fallback,DisabledByUser}`.
+- GI 리소스 생성 전체를 transactional init.
+- 실패 simulation flag.
 
-커밋 메시지: `M9.1: add voxel gi clipmaps`
+의도한 커밋 메시지:
+
+```text
+M9.0: add voxel gi capability and fallback contract
+```
 
 완료 조건:
 
-* 한 cell 이동 시 정확히 128² slab.
-* teleport는 full rebuild.
-* 겹치는 logical voxel bitwise 보존.
-* 네 level material/light ready.
-* clipmap 약 64MiB.
-* 미지원 simulation 테스트에서 fallback.
+- 지원 장치에서 Enabled.
+- 강제 format/pipeline failure에서 게임 정상, `GI disabled: ...; using baked light + GTAO` 정확히 1회.
+- fallback에서 GI dispatch 0.
+- `unsafe`, `wgpu-hal`, ray query, acceleration structure 문자열이 소스에 없음.
 
-**M9.2 DDA trace**
+### M9.1 — 4-level clipmap·토로이달 slab
 
 만드는 것:
 
-* 1/4해상도 compute.
-* cosine Hammersley 4 rays.
-* 48블록·96 crossing.
-* 거리별 level 전환.
-* RGB TORCH emission.
-* sky·CSM hit radiance.
-* HDR GI composite.
+- 128³×4 material/light textures.
+- level 0/1 World, level 2/3 LOD source.
+- logical origin·ring offset.
+- exposed slab 분할 upload.
+- ready revision과 coarse fallback.
+- edit invalidation.
 
-커밋 메시지: `M9.2: trace diffuse gi with compute dda`
+의도한 커밋 메시지:
+
+```text
+M9.1: add toroidal voxel gi clipmaps
+```
 
 완료 조건:
 
-* DDA 양·음 좌표 테스트.
-* 첫 opaque voxel hit 정확.
-* 모든 ray가 normal hemisphere 위.
-* GI room shadow crop 밝기 1.20~2.50배.
-* warm color ratio ≥1.15.
-* trace p95 ≤1.8ms.
+- one-cell move 정확히 128² new cells.
+- overlapping logical voxels bitwise 동일.
+- delta≥128 full rebuild.
+- frame upload ≤4MiB.
+- texture memory 약 64MiB ±2MiB.
+- level priority 0→1→2→3.
 
-**M9.3 temporal·à-trous·fallback**
+### M9.2 — WGSL compute DDA trace
 
 만드는 것:
 
-* history GI/moments/depth/normal.
-* world position reprojection.
-* depth·normal reject.
-* 3×3 clamp.
-* 3단계 à-trous.
-* 전체 GI transactional fallback.
+- quarter-res 8×8 compute.
+- 4 cosine Hammersley rays.
+- max 48, crossing 96.
+- distance band level switch.
+- first-hit material, CSM sun, sky miss.
+- six emissive block RGB.
+- indirect composite.
 
-커밋 메시지: `M9.3: stabilize and denoise voxel gi`
+의도한 커밋 메시지:
+
+```text
+M9.2: trace colored voxel gi with compute dda
+```
 
 완료 조건:
 
-* warmup 32 high-frequency ≤warmup 1의 65%.
-* depth edge 대비 80% 이상 유지.
-* invalid shader/format simulation 후 게임 정상 렌더.
-* fallback dispatch 0.
-* temporal+denoise p95 ≤1.05ms.
+- positive/negative-coordinate DDA first hit 정확.
+- cosine samples dot(N,d)≥0.
+- all outputs finite/nonnegative.
+- m9 room GI on/off shadow brightness ratio 1.20~2.50.
+- warm torch R/mean(GB) ≥1.15.
+- trace p95 ≤1.75ms.
 
-**M9.4 통합·성능·회귀**
+### M9.3 — temporal·moments·à-trous
 
 만드는 것:
 
-* M7~M9 최종 프레임 그래프.
-* `--view gi|clipmap`.
-* 모든 resize/pause/debug reset.
-* timing JSON.
-* LOG에 clipmap upload·GI GPU·전체 frame·메모리.
-* M6 light fallback 회귀.
+- native world reprojection to quarter history.
+- depth/normal/material reject.
+- 3×3 YCoCg/radiance clamp.
+- moments variance.
+- à-trous 1,2,4.
+- resize/teleport/clipmap/history reset.
 
-커밋 메시지: `M9.4: complete voxel gi milestone`
+의도한 커밋 메시지:
+
+```text
+M9.3: temporally stabilize and denoise voxel gi
+```
 
 완료 조건:
 
-* 전체 테스트 **≥124 passed**.
-* GPU GI 합계 p95 ≤3.35ms.
-* 전체 p95 ≤16.6ms.
-* max `<25ms`.
-* R=12 정착 `<5.0s`.
-* clipmap seam 평균 차이 ≤0.08.
-* clippy/fmt/diff 통과.
+- reject 결과 current와 bitwise 동일.
+- warmup32 high-frequency ≤warmup1의 65%.
+- depth edge contrast 80% 이상 보존.
+- temporal+denoise+composite p95 ≤1.15ms.
 
-검증:
+### M9.4 — M9 통합·성능
+
+만드는 것:
+
+- debug `gi|clipmap`.
+- clipmap seam fixtures.
+- full M7~M9 timing JSON.
+- baked-light fallback snapshot.
+- LOG 수치.
+
+의도한 커밋 메시지:
+
+```text
+M9.4: complete compute voxel gi
+```
+
+완료 조건:
+
+- 전체 테스트 ≥134 passed.
+- GI GPU 합계 p95 ≤3.20ms.
+- M7~M9 GPU p95 ≤15.0ms.
+- 전체 frame p95 ≤16.6ms, max <25ms.
+- clipmap seam 평균 선형 RGB 차이 ≤0.08.
+- R=10 settled <5.0s.
+- clippy/fmt/diff 통과.
+
+검증 명령:
 
 ```bash
 cargo test --all-targets
@@ -751,173 +827,229 @@ cargo fmt --all -- --check
 git diff --check
 
 cargo run --release --bin snapshot -- \
-  --fixture m9-gi-room --size 640x360 --gi off \
-  --fixed-exposure 1.0 --warmup 32 \
+  --fixture m9-gi-room --size 1280x720 --preset m5_air_high \
+  --gi off --fixed-exposure 1.0 --warmup 32 \
   --out /tmp/vf_m9_gi_off.png
-
 cargo run --release --bin snapshot -- \
-  --fixture m9-gi-room --size 640x360 --gi on \
-  --fixed-exposure 1.0 --warmup 32 \
+  --fixture m9-gi-room --size 1280x720 --preset m5_air_high \
+  --gi on --fixed-exposure 1.0 --warmup 32 \
   --out /tmp/vf_m9_gi_on.png
-
 cargo run --release --bin snapshot -- \
-  --fixture m9-gi-room --size 640x360 --gi on \
-  --fixed-exposure 1.0 --warmup 32 --view gi \
+  --fixture m9-gi-room --size 1280x720 --preset m5_air_high \
+  --gi on --fixed-exposure 1.0 --warmup 32 --view gi \
   --out /tmp/vf_m9_gi_debug.png
 
 cargo run --release --bin snapshot -- \
-  --fixture m9-clipmap --pos 63.5,72,0 --size 640x360 \
-  --gi on --warmup 32 --view gi \
-  --out /tmp/vf_m9_clip_a.png
+  --fixture m9-clipmap --pos 63.5,72,0 --size 1280x720 \
+  --gi on --warmup 32 --view gi --out /tmp/vf_m9_clip_a.png
+cargo run --release --bin snapshot -- \
+  --fixture m9-clipmap --pos 64.5,72,0 --size 1280x720 \
+  --gi on --warmup 32 --view gi --out /tmp/vf_m9_clip_b.png
 
 cargo run --release --bin snapshot -- \
-  --fixture m9-clipmap --pos 64.5,72,0 --size 640x360 \
-  --gi on --warmup 32 --view gi \
-  --out /tmp/vf_m9_clip_b.png
-
-cargo run --release --bin snapshot -- \
-  --fixture m9-gi-room --size 2560x1440 \
-  --render-scale 0.75 --gi on --warmup 60 --frames 180 \
-  --timings /tmp/vf_m9_timings.json \
-  --out /tmp/vf_m9_perf.png
-
-python3 - <<'PY'
-import json
-d=json.load(open("/tmp/vf_m9_timings.json"))
-gi=sum(d[k]["p95_ms"] for k in
-       ["gi_clipmap","gi_trace","gi_temporal","gi_denoise","gi_composite"])
-print("gi p95 sum",gi)
-assert gi <= 3.35
-assert d["total_gpu"]["p95_ms"] <= 15.5
-PY
+  --fixture m9-gi-room --size 2560x1440 --preset m5_air_high \
+  --gi on --warmup 60 --frames 240 \
+  --timings /tmp/vf_m9_timings.json --out /tmp/vf_m9_perf.png
 ```
 
-BLUEPRINT §18.6의 모든 픽셀 판정을 실행한다.
-
-**M9가 끝나면 멈춘다.** LOG에 `M8·M9 완료, 리뷰 요청`을 기록하고 진헌에게 같은 문구로 보고한다. Claude 리뷰·커밋 전에는 M10으로 가지 않는다.
+M9 검증이 통과하면 LOG에 `M9 검증 완료 — 무중단 규칙에 따라 M10 진행`을 적고 **멈추지 말고 M10.0으로 간다.**
 
 ---
 
-## M10 — 배포 가능한 게임 마감
+## M10 — 122개 건축 아이템·I 인벤토리·손·배포 마감
 
-설계는 BLUEPRINT §19다.
-
-**M10.1 설정·프리셋·GameClock**
+### M10.0 — 안정 ID 레지스트리·재질 recipe·ItemId
 
 만드는 것:
 
-* `cargo add font8x8`, `cargo add rodio`; 실제 버전 LOG.
-* `Settings` JSON version 1.
-* CLI/env/settings 우선순위.
-* atomic write.
-* Performance/Balanced/Quality.
-* pause 가능한 GameClock.
-* Streamer radius runtime 변경.
-* render target·shadow 설정 안전 재생성.
+- BLUEPRINT §20.6.2 BlockId 0~88와 상태 range.
+- ItemId 0~122와 7 categories.
+- 122 `ItemDef` 정확한 순서.
+- `TextureRecipe` patterns·palette.
+- 기존 alias `LOG/LEAVES/PLANKS/GLASS/BRICK/COBBLE` 유지.
+- emission RGB와 light-blocking 분리.
 
-커밋 메시지: `M10.1: add settings and performance presets`
+의도한 커밋 메시지:
+
+```text
+M10.0: add stable creative block and item catalog
+```
 
 완료 조건:
 
-* 설정 roundtrip·clamp·unknown field·atomic 테스트.
-* 기본값 Balanced.
-* pause 중 월드 시각 변화 0.
-* radius 변경 뒤 새 desired set으로 정착.
-* invalid JSON은 `.invalid-*`로 보존.
+- ItemId 1..122 unique·gap 없음.
+- 모든 item name unique.
+- 모든 placement가 유효 concrete BlockId를 생성.
+- 기존 ID 0..12 의미 bitwise 동일.
+- 기존 M6 full opaque lighting snapshot 동일.
+- 모든 texture recipe가 16×16 albedo/material/emission layer 생성.
+- NaN/Inf 0, alpha·roughness·height 범위 0..1.
 
-**M10.2 HUD·pause·스크린샷**
+### M10.1 — 1/16 shape·정점·메셔
 
 만드는 것:
 
-* 8×8 ASCII atlas.
-* HUD·9칸 hotbar·crosshair.
-* pause/settings UI.
-* key rebinding.
-* F2 3-buffer screenshot.
-* snapshot `--ui hud|pause|settings`.
+- `ShapeMask`, cached templates, collision boxes.
+- axis logs, bottom/top slabs, 8 stair states, 16 pane states, 16 fence states.
+- frac_x/y/z vertex bits.
+- partial-neighbor coverage subtraction.
+- micro AO.
+- opaque/cutout/glass/water pass routing.
 
-커밋 메시지: `M10.2: add hud menus and screenshots`
+의도한 커밋 메시지:
+
+```text
+M10.1: add subvoxel building shapes and meshing
+```
 
 완료 조건:
 
-* 핫바 중심 오차 ≤0.5px.
-* crosshair 홀·짝 크기 모두 중심.
-* ESC pause/resume.
-* 두 번째 ESC 종료 없음.
-* screenshot 4번째 요청 drop, panic 없음.
-* HUD·pause 픽셀 판정 통과.
-* UI GPU ≤0.25ms.
+- bottom slab occupancy 2048.
+- pane mask0 occupancy 64.
+- fence mask0 occupancy 256.
+- template quads와 exposed microface 집합 bitwise 동일.
+- vertex fraction roundtrip all 0..15.
+- old cube vertices frac 0, M9 terrain regression ≥99.5%.
+- partial face area 보존 정확히 256 subpixels.
+- shape gallery probes 전부 통과.
+- M10 shape mesh CPU p95 ≤기존 full-cube mesh의 2.5배/동일 visible block 4096 fixture.
 
-**M10.3 절차 사운드**
+### M10.2 — 물리·shape raycast·배치 규칙
 
 만드는 것:
 
-* rodio output.
-* footstep/break/place/water PCM.
-* 거리 기반 발소리.
-* max 16 voices.
-* silent fallback.
-* `--audio-self-test`.
+- shape collision AABB 순회.
+- fence 1.5 collision.
+- DDA cell+shape AABB raycast.
+- axis log placement.
+- slab top/bottom/merge.
+- stair facing/upside-down.
+- pane/fence five-cell connection update.
+- middle-click pick block.
+- hand action event ID 생성 지점.
 
-커밋 메시지: `M10.3: add procedural game audio`
+의도한 커밋 메시지:
+
+```text
+M10.2: add shaped collision raycast and placement
+```
 
 완료 조건:
 
-* PCM deterministic.
-* peak ≤0.95.
-* self-test WAV 48kHz mono.
-* RMS 0.01~0.40.
-* 장치 초기화 실패 simulation 후 게임 계속 실행.
+- pane empty region ray가 뒤 블록을 맞춤.
+- stair step hit normal·local_hit 정확.
+- 8 stair state placement fixture 정확.
+- same-material slab pair full block merge.
+- pane/fence edit 후 center+4 neighbor state 정확.
+- 사용자 edit 하나당 각 chunk version 최대 1 증가.
+- player가 bottom slab·stair를 올라가고 pane를 통과하지 않음.
+- fence 위로 일반 jump로 넘지 못함.
+- pick block existing slot 선택/absent replace 계약 통과.
+- hold repeat가 LMB 0.22/0.10, RMB 0.25/0.12초 계약과 일치하고 frame당 edit 1회 이하.
 
-**M10.4 셰이더팩**
+### M10.3 — item icon·HUD·I 인벤토리
 
 만드는 것:
 
-* manifest version/contract.
-* user/builtin 경로.
-* shader·texture precedence.
-* path traversal 방지.
-* 전체 팩 transactional compile/swap.
-* hotreload.
+- `cargo add font8x8` 실제 버전 기록.
+- ASCII 8×8 atlas.
+- 122-layer item icon bake.
+- hotbar·crosshair.
+- `I` modal inventory.
+- category, search, 9×6 grid, scroll, tooltip.
+- click·number hotbar assignment.
+- quarter-res modal blur.
+- snapshot `--ui inventory|hud|pause`, inventory fixture args.
 
-커밋 메시지: `M10.4: add user shader packs`
+의도한 커밋 메시지:
+
+```text
+M10.3: add creative inventory hud and item icons
+```
 
 완료 조건:
 
-* invalid name·filename 거부.
-* broken WGSL 후 builtin/이전 팩 유지.
-* texture override 정확.
-* UI shader override 거부.
-* 모든 pipeline hotreload 실패 시 panic 없음.
+- icon layer 정확히 122, bake ≤500ms.
+- 모든 icon nontransparent bbox 20..60px.
+- inventory all 화면 54 occupied cells.
+- `Shapes + stair` filter 정확히 12 items.
+- hotbar center error ≤0.5px.
+- I open에서 cursor unlock·world time/physics 정지.
+- streaming apply/save/shader reload는 open 중 계속.
+- Escape는 inventory를 먼저 닫고 pause를 열지 않음.
+- inventory blur+UI p95 ≤0.45ms.
+- BLUEPRINT §20.12.3 픽셀 스크립트 통과.
 
-**M10.5 `.app`·아이콘·서명·최종 성능**
+### M10.4 — 1인칭 손·상호작용·설정·사운드
 
 만드는 것:
 
-* procedural icon.
-* `assets/macos/Info.plist`.
-* launcher.
-* bundle/notarize scripts.
-* app resource copy.
-* codesign.
-* 최종 Balanced benchmark.
-* 최종 LOG.
+- native LDR right-hand viewmodel.
+- held item mesh cache.
+- idle/walk/break/place/switch animations.
+- settings version 2 migration·creative hotbar.
+- `cargo add rodio` 실제 버전 기록.
+- 기존 4 sound + inventory/switch sound.
+- screenshot 3-buffer.
+- pause/settings UI.
 
-커밋 메시지: `M10.5: package voxelforge for macOS`
+의도한 커밋 메시지:
+
+```text
+M10.4: add first person hand settings audio and screenshots
+```
 
 완료 조건:
 
-* 전체 테스트 **≥141 passed**.
-* `target/dist/Voxelforge.app` 구조 정확.
-* `plutil -lint` 통과.
-* ad-hoc `codesign --verify --strict` 통과.
-* launcher에서 `VF_ASSETS`, `VF_SAVE_ROOT`, `VF_SETTINGS`, `VF_SHADERPACKS`, `VF_SCREENSHOTS` 설정.
-* launcher smoke 3프레임 정상.
-* Balanced 2560×1440 p95 ≤16.6ms, max `<25ms`.
-* 추정 렌더 메모리 `<1.25GiB`.
-* clippy/fmt/diff 통과.
+- break 0.26, place 0.18, switch 0.20초 reference 정확.
+- action priority Place>Break>Switch>Idle.
+- pause/inventory 1초 전후 transform bitwise 동일.
+- hand crop 변경률 break/place 2~30%, world crop ≤0.1%.
+- settings v1→v2 migrate, hotbar roundtrip.
+- invalid JSON preservation·atomic temp cleanup.
+- PCM same seed bitwise 동일, peak ≤0.95.
+- audio device failure silent fallback.
+- screenshot 4번째 queue request drop, panic 0.
+- viewmodel p95 ≤0.15ms, HUD p95 ≤0.18ms.
 
-검증:
+### M10.5 — 셰이더팩 contract 2·`.app`·최종 검증
+
+만드는 것:
+
+- shaderpack contract 2.
+- albedo/material/emission/hand overrides.
+- whole-pack transactional compile/swap.
+- path traversal 방지.
+- app launcher·Info.plist·icon·bundle/codesign/notarize scripts.
+- full debug cycle.
+- 최종 M5 Air benchmark 3600 frames.
+- LOG 최종 기록.
+
+의도한 커밋 메시지:
+
+```text
+M10.5: finish voxelforge creative build and macos release
+```
+
+완료 조건:
+
+- 전체 테스트 ≥185 passed.
+- contract1 거부, contract2 broken shader에서 이전/builtin 유지.
+- UI shader·registry·shape override 거부.
+- `plutil -lint` 통과.
+- ad-hoc `codesign --verify --strict` 통과.
+- bundle launcher smoke 3 frames.
+- `m5_air_high`, 2560×1440, R=10:
+  - settled <5.0s.
+  - GPU p95 ≤15.40ms HUD, ≤15.75ms inventory.
+  - full frame p95 ≤16.6ms.
+  - max <25ms.
+  - memory <1.35GiB.
+- clippy/fmt/diff 통과.
+- render loop panic·validation error 0.
+- renderer steady allocations 중앙값 0, p95 0/frame.
+
+최종 검증 명령:
 
 ```bash
 cargo test --all-targets
@@ -926,59 +1058,90 @@ cargo fmt --all -- --check
 git diff --check
 
 cargo run --release --bin snapshot -- \
-  --fixture m10-hud --size 1280x720 --ui hud \
-  --out /tmp/vf_m10_hud.png
+  --fixture m10-shapes --size 1280x720 --render-scale 1.0 \
+  --preset m5_air_high --fixed-exposure 1.0 --warmup 16 \
+  --view final --out /tmp/vf_m10_shapes.png
 
 cargo run --release --bin snapshot -- \
-  --fixture m10-hud --size 1280x720 --ui pause \
-  --out /tmp/vf_m10_pause.png
+  --fixture m10-inventory --size 1280x720 --ui inventory \
+  --inventory-category all --inventory-query "" \
+  --out /tmp/vf_m10_inventory.png
+cargo run --release --bin snapshot -- \
+  --fixture m10-inventory --size 1280x720 --ui inventory \
+  --inventory-category shapes --inventory-query "stair" \
+  --out /tmp/vf_m10_inventory_stair.png
 
-cargo run --release -- \
-  --audio-self-test /tmp/vf_audio.wav
+cargo run --release --bin snapshot -- \
+  --fixture m10-viewmodel --size 1280x720 --hand-action idle \
+  --held-item 101 --world-time 0.0 --out /tmp/vf_hand_idle.png
+cargo run --release --bin snapshot -- \
+  --fixture m10-viewmodel --size 1280x720 --hand-action break:0.13 \
+  --held-item 101 --world-time 0.0 --out /tmp/vf_hand_break.png
+cargo run --release --bin snapshot -- \
+  --fixture m10-viewmodel --size 1280x720 --hand-action place:0.09 \
+  --held-item 101 --world-time 0.0 --out /tmp/vf_hand_place.png
+
+cargo run --release -- --audio-self-test /tmp/vf_audio.wav
 
 rm -rf /tmp/vf_shaderpacks
 mkdir -p /tmp/vf_shaderpacks/broken/shaders
 cat >/tmp/vf_shaderpacks/broken/pack.json <<'JSON'
 {
   "version": 1,
-  "contract_version": 1,
+  "contract_version": 2,
   "name": "Broken",
   "author": "test",
   "shaders": ["deferred.wgsl"],
   "textures": []
 }
 JSON
-printf 'this is not wgsl\n' \
-  >/tmp/vf_shaderpacks/broken/shaders/deferred.wgsl
-
+printf 'this is not wgsl\n' >/tmp/vf_shaderpacks/broken/shaders/deferred.wgsl
 VF_SHADERPACKS=/tmp/vf_shaderpacks VF_SHADERPACK=broken \
-VF_SMOKE_FRAMES=3 cargo run --release 2>&1 | \
-tee /tmp/vf_shaderpack.log
-
+VF_SMOKE_FRAMES=3 cargo run --release 2>&1 | tee /tmp/vf_shaderpack.log
 grep -q "shader pack.*rejected" /tmp/vf_shaderpack.log
-grep -q "using builtin" /tmp/vf_shaderpack.log
+grep -Eq "using builtin|keeping previous" /tmp/vf_shaderpack.log
 
 bash scripts/bundle.sh
 plutil -lint target/dist/Voxelforge.app/Contents/Info.plist
 codesign --verify --strict --verbose=2 target/dist/Voxelforge.app
-
 VF_SMOKE_FRAMES=3 \
   target/dist/Voxelforge.app/Contents/MacOS/voxelforge-launcher
-
 bash -n scripts/notarize.sh
 
-VF_PRESET=balanced VF_AUTOPILOT=stream VF_BENCH_FRAMES=3600 \
+VF_PRESET=m5_air_high VF_RADIUS=10 \
+VF_AUTOPILOT=creative-build VF_BENCH_FRAMES=3600 \
   cargo run --release 2>&1 | tee /tmp/vf_m10_bench.log
 ```
 
-BLUEPRINT §19.6의 HUD·설정·WAV 픽셀/수치 판정을 전부 실행한다.
+`VF_AUTOPILOT=creative-build` 계약:
 
-**M10이 끝나면 멈춘다.** LOG에 `M10 완료, 최종 리뷰 요청`을 기록하고 진헌에게 같은 문구로 보고한다. Claude 최종 리뷰·커밋 전에는 완료로 선언하지 않는다.
+- first 600 frame warmup.
+- 600~1200 walk/fly and stream.
+- 1200~1800 place/break cube/slab/stair/pane/fence.
+- 1800~2400 water/cloud/GI camera route.
+- 2400~3000 inventory open, search `stair`, hotbar assignment, close.
+- 3000~3600 viewmodel action and settled scene.
+- 실제 save는 `/tmp/vf_m10_bench_save`로 격리.
 
-## 리뷰 체크리스트 (Claude, 각 마일스톤 뒤)
+최종 LOG 필수 수치:
 
-1. 검증 명령 전부 직접 재실행.
-2. 스냅샷 PNG 열어 확인(뒤집힌 면, 구멍, 텍스처 방향, 색).
-3. BLUEPRINT 계약(이름·시그니처·비트 레이아웃·면 순서)과 코드 대조.
-4. 렌더 루프 `unwrap` 검색, `CurrentSurfaceTexture` 전 변형 처리 확인.
-5. LOG의 「설계와 다르게 한 것」 검토 → 수용이면 BLUEPRINT 갱신, 아니면 수정 요청.
+```text
+HEAD/base M6 commit
+final test count
+list of every source module whose line count is >=400
+all cargo add commands and resolved versions
+M7/M8/M9/M10 timing JSON paths
+pass median/p95 and total p95/max
+settled seconds
+world/render/LOD/clipmap/icon memory estimates
+122 item catalog validation
+shape mesh vertex counts
+inventory pixel results
+viewmodel crop-diff results
+audio RMS/peak
+shaderpack failure fallback
+bundle path and codesign output
+notarize executed/skipped and truthful reason
+```
+
+M10 검증을 전부 통과한 뒤에만 멈춘다. LOG 맨 위에 `M7~M10 완료, 최종 리뷰 요청`을 기록하고 같은 문구로 진헌에게 보고한다.

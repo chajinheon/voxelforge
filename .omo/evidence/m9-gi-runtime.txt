@@ -1,0 +1,15 @@
+M9 runtime GI verification (2026-09-05 KST)
+
+Scenario: m9-gi-room, 1280x720, m5_air_high, fixed exposure 1.0, warmup 32.
+Invocations:
+  cargo run --release --bin snapshot -- --fixture m9-gi-room --size 1280x720 --preset m5_air_high --gi off --fixed-exposure 1.0 --warmup 32 --out /tmp/vf_m9_gi_off4.png
+  cargo run --release --bin snapshot -- --fixture m9-gi-room --size 1280x720 --preset m5_air_high --gi on --fixed-exposure 1.0 --warmup 32 --out /tmp/vf_m9_gi_on4.png
+  cargo run --release --bin snapshot -- --fixture m9-gi-room --size 1280x720 --preset m5_air_high --gi on --fixed-exposure 1.0 --warmup 32 --view gi --out /tmp/vf_m9_gi_debug4.png
+  cmp /tmp/vf_m9_gi_off2.png /tmp/vf_m9_gi_off4.png
+
+Binary observables (RGB, crop y=120..620 x=180..1100):
+  GI off mean=95.22513; GI on mean=116.25896; brightness ratio=1.2208853 (required 1.20..2.50).
+  GI debug mean=195.14294; debug-vs-on differing channel bytes=2,756,553; finite=true; min=144.
+  GI-off repeat is byte-identical: OFF_BITWISE_IDENTICAL.
+
+Artifacts: /tmp/vf_m9_gi_off4.png, /tmp/vf_m9_gi_on4.png, /tmp/vf_m9_gi_debug4.png.

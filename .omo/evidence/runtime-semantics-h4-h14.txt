@@ -1,0 +1,13 @@
+Fri Sep  4 21:31:40 UTC 2026
+H4/H12/H13/H14 integration patch
+renderer invalidate_shadows + GI invalidation on successful edit
+settings adjust applies renderer preset/GI/render quality immediately
+shaderpack apply already constructs chunk/deferred/water candidates transactionally; water reload API remains inert
+interaction_id shared by viewmodel and edit/inventory audio seed; pane/fence classified by placed block id
+focused test added: interaction_id_is_carried_by_hand_action
+verification blocked by concurrent GI compile errors in src/render/gi/gpu.rs and runtime.rs
+
+H13 update: filesystem watcher now uses reload_chunk_water_bundle
+candidate order: chunk opaque -> translucent -> water; publish only after all three compile
+WaterPipeline::reload_shader now reads source, constructs candidate, swaps on success, returns false on read/compile failure
+verification blocked by concurrent m7_effects/resources.rs compile errors: missing storage_texture and ambiguous div_ceil

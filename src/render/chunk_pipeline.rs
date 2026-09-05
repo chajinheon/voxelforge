@@ -1,6 +1,5 @@
 //! Chunk vertex/index buffers, bind groups, and the opaque voxel pipeline.
 
-use std::num::NonZeroU64;
 use std::path::Path;
 
 use bytemuck::{Pod, Zeroable};
@@ -11,11 +10,9 @@ use crate::mesh::vertex::ChunkVertex;
 use crate::world::coords::CHUNK_SIZE;
 
 use super::frustum::Frustum;
-use super::globals::{GLOBALS_SIZE, Globals};
+use super::globals::Globals;
+use super::scene_bindings::SceneBindings;
 use super::textures::BlockTextures;
-
-const CHUNK_UNIFORM_SIZE: u64 = 16;
-const DEFAULT_SLOTS: u32 = 16384;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -30,15 +27,23 @@ pub struct GpuChunk {
     pub index_count: u32,
     pub origin: IVec3,
     pub uniform_offset: u32,
-    slot: u32,
+    pub(crate) slot: u32,
 }
 
-/// The two GPU passes belonging to one world chunk. Uploads and removals are
+/// The GPU passes belonging to one world chunk. Uploads and removals are
 /// performed as one unit by the renderer/streamer even when one pass is empty.
 pub struct GpuChunkMeshes {
     pub opaque: Option<GpuChunk>,
     pub translucent: Option<GpuChunk>,
+    pub water: Option<GpuChunk>,
     pub origin: IVec3,
+    pub slot: Option<ChunkSlot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkSlot {
+    pub uniform_offset: u32,
+    pub(crate) slot: u32,
 }
 
 /// Opaque chunk pipeline and its dynamic-offset uniform arena.
@@ -46,16 +51,7 @@ pub struct ChunkPipeline {
     pub pipeline: wgpu::RenderPipeline,
     light_pipeline: wgpu::RenderPipeline,
     shader_module: wgpu::ShaderModule,
-    pub globals_buffer: wgpu::Buffer,
-    pub globals_bind_group: wgpu::BindGroup,
-    pub texture_bind_group: wgpu::BindGroup,
-    globals_layout: wgpu::BindGroupLayout,
-    texture_layout: wgpu::BindGroupLayout,
-    chunk_bind_group: wgpu::BindGroup,
-    chunk_uniforms: wgpu::Buffer,
-    chunk_layout: wgpu::BindGroupLayout,
-    slot_size: u64,
-    free_slots: Vec<u32>,
+    pub(crate) bindings: SceneBindings,
     shader_path: std::path::PathBuf,
     blend: bool,
 }
@@ -70,7 +66,13 @@ impl ChunkPipeline {
         textures: &BlockTextures,
         shader_path: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_mode(device, queue, color_format, textures, shader_path, false)
+        Self::new_with_bindings(
+            device,
+            color_format,
+            shader_path,
+            SceneBindings::new(device, queue, textures),
+            false,
+        )
     }
 
     pub(crate) fn new_translucent(
@@ -80,131 +82,82 @@ impl ChunkPipeline {
         textures: &BlockTextures,
         shader_path: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_mode(device, queue, color_format, textures, shader_path, true)
+        Self::new_with_bindings(
+            device,
+            color_format,
+            shader_path,
+            SceneBindings::new(device, queue, textures),
+            true,
+        )
     }
 
-    fn new_with_mode(
+    pub(crate) fn new_shared(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         color_format: wgpu::TextureFormat,
-        textures: &BlockTextures,
         shader_path: impl AsRef<Path>,
+        bindings: SceneBindings,
         translucent: bool,
     ) -> anyhow::Result<Self> {
-        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("globals-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: NonZeroU64::new(GLOBALS_SIZE),
-                },
-                count: None,
-            }],
-        });
-        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("block-texture-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let chunk_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("chunk-dynamic-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: NonZeroU64::new(CHUNK_UNIFORM_SIZE),
-                },
-                count: None,
-            }],
-        });
+        Self::new_with_bindings(device, color_format, shader_path, bindings, translucent)
+    }
 
-        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("globals-uniform"),
-            size: GLOBALS_SIZE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&globals_buffer, 0, bytemuck::bytes_of(&Globals::zeroed()));
-        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals-bind-group"),
-            layout: &globals_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buffer.as_entire_binding(),
-            }],
-        });
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("block-texture-bind-group"),
-            layout: &texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&textures.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&textures.sampler),
-                },
-            ],
-        });
+    pub(crate) fn new_shared_source(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        source: &str,
+        shader_path: impl AsRef<Path>,
+        bindings: SceneBindings,
+        translucent: bool,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_bindings_source(
+            device,
+            color_format,
+            source.to_owned(),
+            shader_path,
+            bindings,
+            translucent,
+        )
+    }
 
-        let alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
-        let slot_size = CHUNK_UNIFORM_SIZE
-            .max(256)
-            .next_multiple_of(alignment.max(1));
-        let uniform_size = slot_size * DEFAULT_SLOTS as u64;
-        let chunk_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("chunk-uniform-arena"),
-            size: uniform_size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let chunk_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("chunk-dynamic-bind-group"),
-            layout: &chunk_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &chunk_uniforms,
-                    offset: 0,
-                    size: NonZeroU64::new(CHUNK_UNIFORM_SIZE),
-                }),
-            }],
-        });
+    fn new_with_bindings(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        shader_path: impl AsRef<Path>,
+        bindings: SceneBindings,
+        translucent: bool,
+    ) -> anyhow::Result<Self> {
+        let shader_path = shader_path.as_ref().to_owned();
+        let source = std::fs::read_to_string(&shader_path)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", shader_path.display()))?;
+        Self::new_with_bindings_source(
+            device,
+            color_format,
+            source,
+            shader_path,
+            bindings,
+            translucent,
+        )
+    }
+
+    fn new_with_bindings_source(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        source: String,
+        shader_path: impl AsRef<Path>,
+        bindings: SceneBindings,
+        translucent: bool,
+    ) -> anyhow::Result<Self> {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk-pipeline-layout"),
             bind_group_layouts: &[
-                Some(&globals_layout),
-                Some(&texture_layout),
-                Some(&chunk_layout),
+                Some(&bindings.globals_layout),
+                Some(&bindings.texture_layout),
+                Some(&bindings.chunk_layout),
             ],
             immediate_size: 0,
         });
 
         let shader_path = shader_path.as_ref().to_owned();
-        let source = std::fs::read_to_string(&shader_path)
-            .map_err(|error| anyhow::anyhow!("{}: {error}", shader_path.display()))?;
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chunk-shader"),
@@ -234,16 +187,7 @@ impl ChunkPipeline {
             pipeline,
             light_pipeline,
             shader_module,
-            globals_buffer,
-            globals_bind_group,
-            texture_bind_group,
-            globals_layout,
-            texture_layout,
-            chunk_bind_group,
-            chunk_uniforms,
-            chunk_layout,
-            slot_size,
-            free_slots: (0..DEFAULT_SLOTS).rev().collect(),
+            bindings,
             shader_path,
             blend: translucent,
         })
@@ -254,15 +198,19 @@ impl ChunkPipeline {
     }
 
     pub(crate) fn globals_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.globals_layout
+        &self.bindings.globals_layout
     }
 
     pub(crate) fn globals_bind_group(&self) -> &wgpu::BindGroup {
-        &self.globals_bind_group
+        &self.bindings.globals_bind_group
+    }
+
+    pub(crate) fn scene_bindings(&self) -> SceneBindings {
+        self.bindings.clone()
     }
 
     pub fn update_globals(&self, queue: &wgpu::Queue, globals: &Globals) {
-        globals.write(queue, &self.globals_buffer);
+        globals.write(queue, &self.bindings.globals_buffer);
     }
 
     /// Upload a mesh and reserve its dynamic uniform slot.
@@ -277,9 +225,20 @@ impl ChunkPipeline {
             anyhow::bail!("cannot upload an empty chunk mesh");
         }
         let slot = self
-            .free_slots
-            .pop()
+            .bindings
+            .reserve_slot()
             .ok_or_else(|| anyhow::anyhow!("chunk uniform arena exhausted"))?;
+        self.upload_chunk_with_slot(device, queue, mesh, origin, slot)
+    }
+
+    pub(crate) fn upload_chunk_with_slot(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &ChunkMesh,
+        origin: IVec3,
+        slot: u32,
+    ) -> anyhow::Result<GpuChunk> {
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk-vertices"),
             size: (mesh.vertices.len() * std::mem::size_of::<ChunkVertex>()) as u64,
@@ -298,8 +257,8 @@ impl ChunkPipeline {
             origin: [origin.x, origin.y, origin.z, 0],
         };
         queue.write_buffer(
-            &self.chunk_uniforms,
-            slot as u64 * self.slot_size,
+            &self.bindings.chunk_uniforms,
+            slot as u64 * self.bindings.slot_size,
             bytemuck::bytes_of(&uniform),
         );
         Ok(GpuChunk {
@@ -307,14 +266,14 @@ impl ChunkPipeline {
             index_buffer,
             index_count: mesh.indices.len() as u32,
             origin,
-            uniform_offset: (slot as u64 * self.slot_size) as u32,
+            uniform_offset: (slot as u64 * self.bindings.slot_size) as u32,
             slot,
         })
     }
 
     /// Return a dynamic slot when a chunk is removed from the world.
     pub fn remove_chunk(&mut self, chunk: GpuChunk) {
-        self.free_slots.push(chunk.slot);
+        self.bindings.release_slot(chunk.slot);
     }
 
     /// Recompile and replace the pipeline. On validation failure, the old
@@ -341,9 +300,9 @@ impl ChunkPipeline {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("chunk-pipeline-layout-reloaded"),
             bind_group_layouts: &[
-                Some(&self.globals_layout),
-                Some(&self.texture_layout),
-                Some(&self.chunk_layout),
+                Some(&self.bindings.globals_layout),
+                Some(&self.bindings.texture_layout),
+                Some(&self.bindings.chunk_layout),
             ],
             immediate_size: 0,
         });
@@ -409,8 +368,8 @@ impl ChunkPipeline {
         frustum: &Frustum,
     ) -> usize {
         pass.set_pipeline(&self.light_pipeline);
-        pass.set_bind_group(0, &self.globals_bind_group, &[]);
-        pass.set_bind_group(1, &self.texture_bind_group, &[]);
+        pass.set_bind_group(0, &self.bindings.globals_bind_group, &[]);
+        pass.set_bind_group(1, &self.bindings.texture_bind_group, &[]);
         let mut drawn = 0;
         for chunk in chunks {
             let min = chunk.origin.as_vec3();
@@ -423,10 +382,40 @@ impl ChunkPipeline {
         drawn
     }
 
+    pub(crate) fn draw_mesh_indices<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        meshes: &'a [GpuChunkMeshes],
+        indices: &[usize],
+        translucent: bool,
+        light: bool,
+    ) -> usize {
+        if light {
+            pass.set_pipeline(&self.light_pipeline);
+            pass.set_bind_group(0, &self.bindings.globals_bind_group, &[]);
+            pass.set_bind_group(1, &self.bindings.texture_bind_group, &[]);
+        } else {
+            self.set_state(pass);
+        }
+        let mut drawn = 0;
+        for &index in indices {
+            let chunk = if translucent {
+                meshes.get(index).and_then(|mesh| mesh.translucent.as_ref())
+            } else {
+                meshes.get(index).and_then(|mesh| mesh.opaque.as_ref())
+            };
+            if let Some(chunk) = chunk {
+                self.draw_unchecked(pass, chunk);
+                drawn += 1;
+            }
+        }
+        drawn
+    }
+
     pub(crate) fn set_state<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.globals_bind_group, &[]);
-        pass.set_bind_group(1, &self.texture_bind_group, &[]);
+        pass.set_bind_group(0, &self.bindings.globals_bind_group, &[]);
+        pass.set_bind_group(1, &self.bindings.texture_bind_group, &[]);
     }
 
     pub(crate) fn draw_unchecked<'a>(
@@ -434,7 +423,7 @@ impl ChunkPipeline {
         pass: &mut wgpu::RenderPass<'a>,
         chunk: &'a GpuChunk,
     ) {
-        pass.set_bind_group(2, &self.chunk_bind_group, &[chunk.uniform_offset]);
+        pass.set_bind_group(2, &self.bindings.chunk_bind_group, &[chunk.uniform_offset]);
         pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
         pass.set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..chunk.index_count, 0, 0..1);

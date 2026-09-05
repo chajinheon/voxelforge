@@ -1,0 +1,22 @@
+M9 GPU clipmap contract (2026-09-05)
+
+Implementation: src/render/gi/gpu.rs; shader: assets/shaders/gi_gpu.wgsl.
+try_new(adapter) rejects unsupported Rgba8Unorm 3D/storage or <128 dimensions
+before publishing resources, then allocates four material + four light
+128^3 Rgba8Unorm 3D textures transactionally. Clipmap origins and ring offsets
+are copied into a persistent uniform. upload() splits each z slab so every
+queue.write_texture payload is <= 4 MiB. record() dispatches trace, temporal,
+and denoise at quarter resolution with workgroups of 8x8; user-off/fallback
+sets enabled=false and records zero dispatches.
+
+Verification invocation:
+  cargo fmt --all && cargo check --release
+Observable:
+  Finished `release` profile; source line-count maximum 490 (runtime_effects.rs).
+Renderer integration:
+  Renderer owns Option<GpuGi>, configure_gpu_gi(adapter,width,height) performs
+  one-time transactional initialization/fallback, every frame updates logical
+  clipmap origin/ring state and records the real compute trace/temporal/1-2-4
+  denoise dispatches. configure_gi(false) maps to DisabledByUser and produces
+  zero GPU GI dispatches. gi_clipmap_memory_bytes and gi_dispatch_count expose
+  live benchmark counters.

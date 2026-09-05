@@ -1,6 +1,12 @@
 pub mod assets;
+pub mod audio;
+pub mod config;
+pub mod game_clock;
+pub mod lod;
 pub mod mesh;
 pub mod player;
 pub mod render;
+pub mod shaderpack;
 pub mod stream;
+pub mod ui;
 pub mod world;

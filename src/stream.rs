@@ -3,12 +3,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use glam::IVec3;
+use glam::{IVec3, Vec3};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
+use crate::lod::LodCache;
 use crate::mesh::ChunkMeshes;
+use crate::render::gi::{SlabRegion, UPLOAD_BUDGET_BYTES, VoxelUpload};
 use crate::render::{GpuChunkMeshes, Renderer};
-use crate::world::coords::WORLD_CHUNKS_Y;
+use crate::world::block::{AIR, DIRT, GRASS, RenderClass, SAND, STONE, WATER, def};
+use crate::world::coords::chunk_of;
+use crate::world::r#gen::SEA_LEVEL;
 use crate::world::light::LightColumn;
 use crate::world::save::SaveDir;
 use crate::world::world::World;
@@ -17,8 +21,10 @@ use self::jobs::{Job, ResultMessage};
 
 mod jobs;
 mod lighting;
+mod lod;
 mod persistence;
 mod rendering;
+mod scheduling;
 
 const DEFAULT_RADIUS: i32 = 10;
 const MIN_RADIUS: i32 = 4;
@@ -26,6 +32,119 @@ const MAX_RADIUS: i32 = 16;
 const URGENT_BUDGET: usize = 3;
 const MAIN_BUDGET: Duration = Duration::from_millis(6);
 const GEN_PUMP_BUDGET: Duration = Duration::from_millis(4);
+
+struct PendingGiUpload {
+    level: usize,
+    revision: u32,
+    region: SlabRegion,
+    next_z: u32,
+}
+
+fn fallback_block(world: &World, bp: IVec3) -> u16 {
+    if bp.y < 0 {
+        return STONE;
+    }
+    if bp.y >= crate::world::coords::CHUNK_SIZE * crate::world::coords::WORLD_CHUNKS_Y {
+        return AIR;
+    }
+    let height = world.generator().height_at(bp.x, bp.z);
+    if bp.y < 1 || bp.y <= height - 4 {
+        STONE
+    } else if bp.y < height {
+        DIRT
+    } else if bp.y == height {
+        if height > SEA_LEVEL { GRASS } else { SAND }
+    } else if bp.y <= SEA_LEVEL {
+        WATER
+    } else {
+        AIR
+    }
+}
+
+fn upload_slice(
+    world: &World,
+    renderer: &mut Renderer,
+    pending: &PendingGiUpload,
+    z0: u32,
+    depth: u32,
+    material: &mut Vec<u8>,
+    light: &mut Vec<u8>,
+) {
+    let region = pending.region;
+    let level = pending.level;
+    let cells_per_slice = region.extent.x as usize * region.extent.y as usize;
+    let cells = cells_per_slice * depth as usize;
+    material.clear();
+    material.resize(cells * 4, 0);
+    light.clear();
+    light.resize(cells * 4, 0);
+    for z in 0..depth {
+        for y in 0..region.extent.y {
+            for x in 0..region.extent.x {
+                let index = ((z * region.extent.y + y) * region.extent.x + x) as usize;
+                let cell = region.logical_start
+                    + glam::IVec3::new(x as i32, y as i32, z0 as i32 + z as i32);
+                let world_cell = cell * (1_i32 << level);
+                let block = if world.is_loaded(chunk_of(world_cell)) {
+                    world.get_block(world_cell)
+                } else {
+                    fallback_block(world, world_cell)
+                };
+                let packed = if world.is_loaded(chunk_of(world_cell)) {
+                    world.get_light(world_cell)
+                } else {
+                    0xf0
+                };
+                let (material_cell, light_cell) = encode_gi_cell(block, packed);
+                material[index * 4..index * 4 + 4].copy_from_slice(&material_cell);
+                light[index * 4..index * 4 + 4].copy_from_slice(&light_cell);
+            }
+        }
+    }
+    let upload = VoxelUpload {
+        level: level as u8,
+        logical_origin: region.logical_start + glam::IVec3::new(0, 0, z0 as i32),
+        extent: glam::UVec3::new(region.extent.x, region.extent.y, depth),
+        material: std::mem::take(material),
+        light: std::mem::take(light),
+        revision: pending.revision,
+    };
+    renderer.upload_gi(&upload);
+    *material = upload.material;
+    *light = upload.light;
+}
+
+fn encode_gi_cell(block: u16, packed_light: u8) -> ([u8; 4], [u8; 4]) {
+    let block_def = def(block);
+    let albedo = crate::world::material::recipe(block_def.name)
+        .map_or([128, 128, 128], |recipe| recipe.base_srgb);
+    let opacity = match block_def.render_class {
+        RenderClass::Opaque => u8::from(block != AIR) * 255,
+        RenderClass::Cutout => 128,
+        RenderClass::Translucent | RenderClass::Water => 0,
+    };
+    let block_radiance = f32::from(packed_light & 0x0f) / 15.0;
+    let mut encoded_emission = [0_u8; 3];
+    let block_light_rgb = [block_radiance, block_radiance * 0.42, block_radiance * 0.12];
+    for ((encoded, emission), propagated) in encoded_emission
+        .iter_mut()
+        .zip(block_def.emission_rgb)
+        .zip(block_light_rgb)
+    {
+        *encoded = ((emission + propagated) / 8.0 * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    (
+        [albedo[0], albedo[1], albedo[2], opacity],
+        [
+            encoded_emission[0],
+            encoded_emission[1],
+            encoded_emission[2],
+            (packed_light >> 4) * 17,
+        ],
+    )
+}
 
 pub struct Streamer {
     pool: ThreadPool,
@@ -53,10 +172,21 @@ pub struct Streamer {
     settled: bool,
     save_dir: Option<SaveDir>,
     last_periodic_save: Instant,
+    lod_cache: LodCache,
+    gi_pending: VecDeque<PendingGiUpload>,
+    gi_material_scratch: Vec<u8>,
+    gi_light_scratch: Vec<u8>,
+    gi_invalidated: bool,
+    pub(crate) lod_pending: VecDeque<crate::lod::LodKey>,
 }
 
 impl Streamer {
     pub fn new() -> Self {
+        Self::new_with_radius(configured_radius() as u32)
+    }
+
+    /// Creates a streamer with the persisted video view radius.
+    pub fn new_with_radius(view_radius: u32) -> Self {
         let workers = thread::available_parallelism()
             .map(|count| count.get())
             .unwrap_or(2)
@@ -88,11 +218,17 @@ impl Streamer {
             dirty: HashMap::new(),
             completed_meshes: VecDeque::new(),
             completed_lights: VecDeque::new(),
-            radius: configured_radius(),
+            radius: view_radius.clamp(MIN_RADIUS as u32, MAX_RADIUS as u32) as i32,
             started: Instant::now(),
             settled: false,
             save_dir: None,
             last_periodic_save: Instant::now(),
+            lod_cache: LodCache::new(),
+            gi_pending: VecDeque::new(),
+            gi_material_scratch: Vec::new(),
+            gi_light_scratch: Vec::new(),
+            gi_invalidated: false,
+            lod_pending: VecDeque::new(),
         }
     }
 
@@ -110,6 +246,23 @@ impl Streamer {
             + self.light_inflight.len()
             + self.completed_lights.len()
             + self.completed_meshes.len()
+            + self.gi_pending.len()
+            + self.lod_pending.len()
+    }
+
+    /// CPU/GPU-budgeted hierarchical terrain cache owned by the streamer.
+    pub fn lod_cache(&self) -> &LodCache {
+        &self.lod_cache
+    }
+
+    pub fn lod_memory_bytes(&self) -> (usize, usize) {
+        (self.lod_cache.cpu_bytes(), self.lod_cache.gpu_bytes())
+    }
+
+    /// Total bytes currently retained by the CPU and GPU LOD cache metadata.
+    pub fn lod_cache_memory_bytes(&self) -> usize {
+        let (cpu, gpu) = self.lod_memory_bytes();
+        cpu.saturating_add(gpu)
     }
 
     pub fn mark_urgent(&mut self, cp: IVec3) {
@@ -124,6 +277,7 @@ impl Streamer {
         renderer: &mut Renderer,
         gpu_chunks: &mut Vec<GpuChunkMeshes>,
         center: IVec3,
+        camera_world: Vec3,
     ) {
         let bootstrap = self.desired(center, 1);
         for cp in &bootstrap {
@@ -139,6 +293,12 @@ impl Streamer {
         for cp in bootstrap {
             self.mesh_and_upload(world, renderer, gpu_chunks, cp);
         }
+        self.update_gi_clipmap(renderer, camera_world);
+        self.populate_lod_rings(world, renderer, camera_world);
+        while !self.gi_pending.is_empty() {
+            self.drain_gi_uploads(world, renderer, usize::MAX);
+        }
+        self.lod_cache.set_active_ring_protection(camera_world);
     }
 
     pub fn update(
@@ -147,6 +307,7 @@ impl Streamer {
         renderer: &mut Renderer,
         gpu_chunks: &mut Vec<GpuChunkMeshes>,
         center: IVec3,
+        camera_world: Vec3,
         visible_drawn: usize,
     ) {
         let desired = self.desired_set(center);
@@ -171,249 +332,89 @@ impl Streamer {
         self.dirty
             .retain(|cp, _| desired.contains(cp) && world.is_loaded(*cp));
         self.remove_unloaded_gpu_chunks(world, renderer, gpu_chunks);
+        if self.gi_invalidated {
+            renderer.invalidate_gi_clipmap();
+            self.gi_invalidated = false;
+        }
+        self.update_gi_clipmap(renderer, camera_world);
+        self.populate_lod_rings(world, renderer, camera_world);
+        self.drain_gi_uploads(world, renderer, UPLOAD_BUDGET_BYTES);
+        self.lod_cache.set_active_ring_protection(camera_world);
         self.check_settled(world, &desired, visible_drawn);
     }
 
-    fn desired(&self, center: IVec3, radius: i32) -> Vec<IVec3> {
-        let mut desired = Vec::with_capacity(((radius * 2 + 1).pow(2) * WORLD_CHUNKS_Y) as usize);
-        for z in -radius..=radius {
-            for x in -radius..=radius {
-                for y in 0..WORLD_CHUNKS_Y {
-                    desired.push(IVec3::new(center.x + x, y, center.z + z));
-                }
-            }
-        }
-        desired.sort_by_key(|cp| {
-            let dx = cp.x - center.x;
-            let dy = cp.y - center.y;
-            let dz = cp.z - center.z;
-            (dx * dx + dz * dz, dy.abs(), cp.y)
-        });
-        desired
-    }
-
-    fn desired_set(&self, center: IVec3) -> HashSet<IVec3> {
-        self.desired(center, self.radius).into_iter().collect()
-    }
-
-    fn drain_results(&mut self, world: &mut World, desired: &HashSet<IVec3>) {
-        while let Ok(result) = self.receiver.try_recv() {
-            match result {
-                ResultMessage::Gen { cp, chunk } => {
-                    self.gen_inflight.remove(&cp);
-                    if desired.contains(&cp) && !world.is_loaded(cp) {
-                        world.insert_generated(cp, chunk);
-                    }
-                }
-                ResultMessage::Load { cp, result } => {
-                    self.handle_load_result(cp, result, world, desired);
-                }
-                ResultMessage::Mesh {
-                    cp,
-                    version,
-                    epoch,
-                    mesh,
-                } => {
-                    self.mesh_inflight.remove(&cp);
-                    if desired.contains(&cp) {
-                        self.completed_meshes.push_back((cp, version, epoch, mesh));
-                    } else if world.is_loaded(cp) {
-                        self.dirty.entry(cp).or_insert(false);
-                    }
-                }
-                // M6.1 defines the worker result now; scheduling and applying
-                // lighting remain M6.2 responsibilities.
-                ResultMessage::Light { result, elapsed } => {
-                    self.light_inflight.remove(&result.column);
-                    self.completed_lights.push_back((result, elapsed));
-                }
+    fn update_gi_clipmap(&mut self, renderer: &mut Renderer, camera_world: Vec3) {
+        for update in renderer.update_gi_clipmap(camera_world) {
+            self.gi_pending
+                .retain(|pending| pending.level != update.level);
+            for region in update.regions {
+                self.gi_pending.push_back(PendingGiUpload {
+                    level: update.level,
+                    revision: update.revision,
+                    region,
+                    next_z: 0,
+                });
             }
         }
     }
 
-    fn upload_completed(
+    /// Populate every initial clipmap level before an offscreen capture. This
+    /// deliberately bypasses the interactive per-frame budget.
+    pub fn populate_gi_offline(
         &mut self,
-        world: &mut World,
+        world: &World,
         renderer: &mut Renderer,
-        gpu_chunks: &mut Vec<GpuChunkMeshes>,
-        desired: &HashSet<IVec3>,
-        budget_start: Instant,
+        camera_world: Vec3,
     ) {
-        while budget_start.elapsed() < MAIN_BUDGET {
-            let Some((cp, version, epoch, mesh)) = self.completed_meshes.pop_front() else {
+        self.update_gi_clipmap(renderer, camera_world);
+        while !self.gi_pending.is_empty() {
+            self.drain_gi_uploads(world, renderer, usize::MAX);
+        }
+    }
+
+    fn drain_gi_uploads(&mut self, world: &World, renderer: &mut Renderer, budget: usize) {
+        let mut remaining = budget;
+        let mut completed = Vec::new();
+        while remaining >= 8 && !self.gi_pending.is_empty() {
+            let mut pending = self
+                .gi_pending
+                .pop_front()
+                .expect("GI queue checked non-empty");
+            let cells_per_slice =
+                pending.region.extent.x as usize * pending.region.extent.y as usize;
+            let bytes_per_slice = cells_per_slice.saturating_mul(8);
+            if bytes_per_slice == 0 || remaining < bytes_per_slice {
+                self.gi_pending.push_front(pending);
                 break;
-            };
-            if desired.contains(&cp)
-                && world.chunk_version(cp) == Some(version)
-                && self.mesh_epochs.get(&cp).copied() == Some(epoch)
+            }
+            let max_depth = (remaining / bytes_per_slice) as u32;
+            let depth = max_depth.min(pending.region.extent.z - pending.next_z);
+            upload_slice(
+                world,
+                renderer,
+                &pending,
+                pending.next_z,
+                depth,
+                &mut self.gi_material_scratch,
+                &mut self.gi_light_scratch,
+            );
+            remaining = remaining.saturating_sub(cells_per_slice * depth as usize * 8);
+            pending.next_z += depth;
+            if pending.next_z < pending.region.extent.z {
+                self.gi_pending.push_front(pending);
+            } else {
+                completed.push((pending.level, pending.revision));
+            }
+        }
+        for (level, revision) in completed {
+            if !self
+                .gi_pending
+                .iter()
+                .any(|p| p.level == level && p.revision == revision)
             {
-                self.upload_mesh(world, renderer, gpu_chunks, cp, mesh);
-            } else if world.is_loaded(cp) && desired.contains(&cp) {
-                self.dirty.entry(cp).or_insert(false);
+                renderer.mark_gi_level_ready(level, revision);
             }
         }
-    }
-
-    fn collect_dirty(&mut self, world: &mut World) {
-        for cp in world.take_dirty() {
-            if world.is_loaded(cp) {
-                self.bump_mesh_epoch(cp);
-                self.dirty.entry(cp).or_insert(false);
-            }
-        }
-    }
-
-    fn pump_generation(&mut self, world: &mut World, desired: &HashSet<IVec3>, center: IVec3) {
-        let limit = self.worker_limit();
-        let mut missing: Vec<_> = desired
-            .iter()
-            .filter(|&&cp| {
-                !world.is_loaded(cp)
-                    && !self.gen_inflight.contains(&cp)
-                    && !self.load_inflight.contains(&cp)
-            })
-            .copied()
-            .collect();
-        missing.sort_by_key(|cp| distance_key(*cp, center));
-        let mut missing = VecDeque::from(missing);
-        let started = Instant::now();
-
-        loop {
-            while self.total_inflight() < limit {
-                let Some(cp) = missing.pop_front() else {
-                    break;
-                };
-                if world.is_loaded(cp) {
-                    continue;
-                }
-                if let Some(save) = self.saved_chunk(cp) {
-                    if self.load_inflight.insert(cp) {
-                        self.spawn(Job::Load { cp, save });
-                    }
-                } else if self.gen_inflight.insert(cp) {
-                    self.spawn(Job::Gen {
-                        cp,
-                        generator: world.generator().clone(),
-                    });
-                }
-            }
-            if missing.is_empty()
-                || started.elapsed() >= GEN_PUMP_BUDGET
-                || self.gen_inflight.is_empty()
-            {
-                break;
-            }
-
-            // Fast empty-chunk jobs can finish well inside one display frame.
-            // Reap and refill here so the 2w in-flight cap does not become an
-            // accidental 2w-per-frame throughput cap.
-            thread::yield_now();
-            self.drain_results(world, desired);
-            self.collect_dirty(world);
-        }
-    }
-
-    fn issue_mesh(
-        &mut self,
-        world: &mut World,
-        renderer: &mut Renderer,
-        gpu_chunks: &mut Vec<GpuChunkMeshes>,
-        desired: &HashSet<IVec3>,
-        center: IVec3,
-        budget_start: Instant,
-    ) {
-        if self.lighting_busy() {
-            return;
-        }
-        let available = self.total_limit().saturating_sub(self.total_inflight());
-        if available == 0 {
-            return;
-        }
-        let mut pending: Vec<_> = self
-            .dirty
-            .iter()
-            .filter(|(cp, urgent)| {
-                desired.contains(cp)
-                    && world.light_column_initialized(LightColumn { x: cp.x, z: cp.z })
-                    && !**urgent
-                    && !self.mesh_inflight.contains(cp)
-                    && !self
-                        .completed_meshes
-                        .iter()
-                        .any(|(queued, _, _, _)| queued == *cp)
-            })
-            .map(|(&cp, _)| cp)
-            .collect();
-        pending.sort_by_key(|&cp| distance_key(cp, center));
-        let mut spawned = 0usize;
-        for cp in pending {
-            if budget_start.elapsed() >= MAIN_BUDGET {
-                break;
-            }
-            self.dirty.remove(&cp);
-            if world.chunk(cp).is_none() {
-                continue;
-            }
-            if world.chunk(cp).is_some_and(|chunk| chunk.is_empty()) {
-                self.remove_gpu_chunk(renderer, gpu_chunks, cp);
-                continue;
-            }
-            let Some(version) = world.chunk_version(cp) else {
-                continue;
-            };
-            let epoch = self.mesh_epochs.get(&cp).copied().unwrap_or(0);
-            let padded = Box::new(world.padded(cp));
-            self.mesh_inflight.insert(cp);
-            self.spawn(Job::Mesh {
-                cp,
-                padded,
-                version,
-                epoch,
-            });
-            spawned += 1;
-            if spawned == available {
-                break;
-            }
-        }
-    }
-
-    fn mesh_urgent(
-        &mut self,
-        world: &mut World,
-        renderer: &mut Renderer,
-        gpu_chunks: &mut Vec<GpuChunkMeshes>,
-        desired: &HashSet<IVec3>,
-        center: IVec3,
-        budget_start: Instant,
-    ) {
-        let mut urgent: Vec<_> = self
-            .dirty
-            .iter()
-            .filter(|(cp, is_urgent)| desired.contains(cp) && **is_urgent)
-            .map(|(&cp, _)| cp)
-            .collect();
-        urgent.sort_by_key(|&cp| distance_key(cp, center));
-        for cp in urgent.into_iter().take(URGENT_BUDGET) {
-            if budget_start.elapsed() >= MAIN_BUDGET {
-                break;
-            }
-            if !world.light_column_initialized(LightColumn { x: cp.x, z: cp.z }) {
-                continue;
-            }
-            self.dirty.remove(&cp);
-            if world.chunk(cp).is_some_and(|chunk| chunk.is_empty()) {
-                self.remove_gpu_chunk(renderer, gpu_chunks, cp);
-            } else if world.is_loaded(cp)
-                && world.light_column_initialized(LightColumn { x: cp.x, z: cp.z })
-            {
-                self.mesh_and_upload(world, renderer, gpu_chunks, cp);
-            }
-        }
-    }
-
-    fn spawn(&self, job: Job) {
-        let sender = self.sender.clone();
-        self.pool.spawn(move || jobs::execute(job, sender));
     }
 
     fn bump_mesh_epoch(&mut self, cp: IVec3) {

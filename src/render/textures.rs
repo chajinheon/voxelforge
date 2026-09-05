@@ -102,6 +102,51 @@ impl BlockTextures {
     ) -> anyhow::Result<Self> {
         Self::from_assets(device, queue, asset_root, crate::world::block::TEXTURES)
     }
+
+    /// Replace one existing registry layer in place.  The bind groups used by
+    /// all chunk pipelines point at this texture handle, so a queue upload is
+    /// sufficient and does not invalidate meshes or pipeline state.
+    pub(crate) fn apply_override(
+        &self,
+        queue: &wgpu::Queue,
+        relative_path: &str,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        let name = std::path::Path::new(relative_path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid block texture path: {relative_path}"))?;
+        let Some(layer) = self.names.iter().position(|entry| entry == name) else {
+            anyhow::bail!("shader pack block texture is not in the registry: {name}");
+        };
+        if data.len() != (SIZE * SIZE * 4) as usize {
+            anyhow::bail!("shader pack texture {relative_path} is not RGBA8 16x16");
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(SIZE * 4),
+                rows_per_image: Some(SIZE),
+            },
+            wgpu::Extent3d {
+                width: SIZE,
+                height: SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
 }
 
 fn load_layer(path: &Path, name: &str, layer: u64) -> anyhow::Result<Vec<u8>> {
@@ -212,12 +257,74 @@ fn procedural_layer(name: &str, layer: u64) -> Vec<u8> {
                         [0, 0, 0]
                     }
                 }
+                n if n.ends_with("_glass") => {
+                    let tint: [u8; 3] = match n {
+                        "red_glass" => [220, 75, 70],
+                        "green_glass" => [75, 190, 100],
+                        "cyan_glass" => [65, 200, 200],
+                        "blue_glass" => [75, 115, 220],
+                        _ => [220, 235, 240],
+                    };
+                    if x == 0 || y == 0 || x == SIZE - 1 || y == SIZE - 1 {
+                        tint.map(|v| v.saturating_sub(35))
+                    } else {
+                        tint
+                    }
+                }
+                n if n.contains("concrete") => {
+                    let color = match n {
+                        "white_concrete" => [208, 210, 208],
+                        "light_gray_concrete" => [180, 182, 182],
+                        "gray_concrete" => [128, 130, 132],
+                        "black_concrete" => [38, 40, 44],
+                        "brown_concrete" => [112, 72, 48],
+                        "red_concrete" => [170, 52, 45],
+                        "orange_concrete" => [220, 112, 40],
+                        "yellow_concrete" => [224, 190, 44],
+                        "lime_concrete" => [120, 190, 48],
+                        "green_concrete" => [58, 132, 62],
+                        "cyan_concrete" => [45, 170, 170],
+                        "light_blue_concrete" => [72, 160, 216],
+                        "blue_concrete" => [55, 82, 180],
+                        "purple_concrete" => [122, 68, 170],
+                        "magenta_concrete" => [190, 62, 160],
+                        _ => [232, 120, 160],
+                    };
+                    noisy(color, x, y, layer)
+                }
+                n if matches!(
+                    n,
+                    "glowstone" | "sea_lantern" | "warm_lamp" | "cold_lamp" | "glow_panel"
+                ) =>
+                {
+                    let color = if n == "sea_lantern" || n == "cold_lamp" {
+                        [120, 220, 240]
+                    } else {
+                        [240, 120, 45]
+                    };
+                    noisy(color, x, y, layer)
+                }
+                n if matches!(
+                    n,
+                    "gold_block" | "copper" | "weathered_copper" | "metal_panel" | "rusted_metal"
+                ) =>
+                {
+                    let color = if n == "gold_block" {
+                        [224, 170, 42]
+                    } else if n == "copper" {
+                        [180, 105, 62]
+                    } else {
+                        [160, 166, 172]
+                    };
+                    noisy(color, x, y, layer)
+                }
                 _ => noisy([190, 190, 190], x, y, layer),
             };
             let index = ((y * SIZE + x) * 4) as usize;
             let alpha = match name {
                 "water" => 150,
-                "glass" => 90,
+                "glass" | "white_glass" | "red_glass" | "green_glass" | "cyan_glass"
+                | "blue_glass" => 90,
                 "torch"
                     if {
                         let dx = x as i32 - 8;

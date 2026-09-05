@@ -1,0 +1,25 @@
+UI icon contract validation (2026-09-05)
+
+Scope: src/render/ui.rs, src/render/ui/catalog.rs, src/render/ui/draw.rs,
+src/render/ui/panels.rs, src/render/ui/text.rs, and UI shaders.
+
+Changes:
+- Imported UiScale and removed the invalid private re-export boundary.
+- Item icons now emit exactly one six-vertex textured quad and sample the
+  persistent D2Array atlas layer (id - 1); inventory cells and the HUD hotbar
+  both use this path.
+- Inventory rendering uses a filtered iterator instead of
+  CreativeInventory::visible_items(), avoiding a temporary per-frame Vec.
+- UiRenderer exposes the one-time CPU icon bake duration via icon_bake_ms().
+- UI/viewmodel source modules remain below 500 lines. Inventory blur remains an
+  integration gap: the blur shader is present, but actual source-target
+  compositing requires an offscreen scene texture owned by renderer/effects.
+
+Invocation:
+  cargo fmt --all
+  cargo test render::ui::tests::item_icon_draw_is_one_textured_quad --lib
+
+Observed result:
+  The icon test passed once before unrelated concurrent renderer changes made
+  the shared crate fail to compile. The latest rerun was blocked by an unrelated
+  RuntimeEffectParams { history } compile mismatch in src/render/renderer/effects.rs.

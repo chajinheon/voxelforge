@@ -1,0 +1,7 @@
+GPU timing focused verification
+
+Scenario: timestamp span helpers and valid-mask reporting
+Invocation: cargo fmt --all; cargo check --all-targets; cargo test gpu_timing --lib
+Observable: cargo check completed successfully; 5 GPU timing tests passed
+Implementation: src/render/gpu_timing.rs (439 lines), src/render/renderer/effects.rs
+

@@ -9,6 +9,7 @@ use crate::mesh::mesher::ChunkMesh;
 use super::chunk_pipeline::{ChunkPipeline, GpuChunk};
 use super::frustum::Frustum;
 use super::globals::Globals;
+use super::scene_bindings::SceneBindings;
 use super::textures::BlockTextures;
 
 /// Transparent pass resources. It shares the chunk shader and texture format
@@ -36,6 +37,36 @@ impl TranslucentPipeline {
         })
     }
 
+    pub(crate) fn new_shared(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        shader_path: impl AsRef<Path>,
+        bindings: SceneBindings,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            pipeline: ChunkPipeline::new_shared(device, color_format, shader_path, bindings, true)?,
+        })
+    }
+
+    pub(crate) fn new_shared_source(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        source: &str,
+        shader_path: impl AsRef<Path>,
+        bindings: SceneBindings,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            pipeline: ChunkPipeline::new_shared_source(
+                device,
+                color_format,
+                source,
+                shader_path,
+                bindings,
+                true,
+            )?,
+        })
+    }
+
     pub fn upload_chunk(
         &mut self,
         device: &wgpu::Device,
@@ -48,6 +79,18 @@ impl TranslucentPipeline {
 
     pub fn remove_chunk(&mut self, chunk: GpuChunk) {
         self.pipeline.remove_chunk(chunk);
+    }
+
+    pub(crate) fn upload_chunk_with_slot(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &ChunkMesh,
+        origin: IVec3,
+        slot: u32,
+    ) -> anyhow::Result<GpuChunk> {
+        self.pipeline
+            .upload_chunk_with_slot(device, queue, mesh, origin, slot)
     }
 
     pub fn update_globals(&self, queue: &wgpu::Queue, globals: &Globals) {
@@ -78,5 +121,27 @@ impl TranslucentPipeline {
         frustum: &Frustum,
     ) -> usize {
         self.pipeline.draw_visible_light(pass, chunks, frustum)
+    }
+
+    pub(crate) fn draw_mesh_index<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        meshes: &'a [super::chunk_pipeline::GpuChunkMeshes],
+        index: usize,
+        water: bool,
+    ) -> bool {
+        self.pipeline.set_state(pass);
+        let chunk = meshes.get(index).and_then(|mesh| {
+            if water {
+                mesh.water.as_ref()
+            } else {
+                mesh.translucent.as_ref()
+            }
+        });
+        let Some(chunk) = chunk else {
+            return false;
+        };
+        self.pipeline.draw_unchecked(pass, chunk);
+        true
     }
 }

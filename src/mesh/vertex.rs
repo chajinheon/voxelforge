@@ -11,6 +11,10 @@ pub struct ChunkVertex {
 /// Reserved vertex bit used to lower the top surface of fluid blocks.
 pub const LOWERED_BIT: u32 = 1 << 23;
 
+const FRAC_X_SHIFT: u32 = 24;
+const FRAC_Y_SHIFT: u32 = 28;
+const FRAC_Z_SHIFT: u32 = 24;
+
 /// Pack a vertex using the layout in BLUEPRINT §4.
 #[allow(clippy::too_many_arguments)] // The eight-argument signature is a fixed data contract.
 pub fn pack(
@@ -30,6 +34,39 @@ pub fn pack(
         | ((ao & 0x3) << 21);
     let b = (tex & 0xffff) | ((light & 0xf) << 16) | ((sky & 0xf) << 20);
     ChunkVertex { a, b }
+}
+
+/// Pack a vertex with 1/16-block subvoxel coordinates in the previously
+/// reserved bits. Integer coordinates remain the legacy six-bit fields.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_with_fraction(
+    x: u32,
+    y: u32,
+    z: u32,
+    frac_x: u32,
+    frac_y: u32,
+    frac_z: u32,
+    face: u32,
+    ao: u32,
+    tex: u32,
+    light: u32,
+    sky: u32,
+) -> ChunkVertex {
+    assert!(frac_x < 16 && frac_y < 16 && frac_z < 16);
+    assert!((x < 32 || frac_x == 0) && (y < 32 || frac_y == 0) && (z < 32 || frac_z == 0));
+    let mut vertex = pack(x, y, z, face, ao, tex, light, sky);
+    vertex.a |= (frac_x & 0xf) << FRAC_X_SHIFT;
+    vertex.a |= (frac_y & 0xf) << FRAC_Y_SHIFT;
+    vertex.b |= (frac_z & 0xf) << FRAC_Z_SHIFT;
+    vertex
+}
+
+pub fn unpack_fraction(v: ChunkVertex) -> (u32, u32, u32) {
+    (
+        (v.a >> FRAC_X_SHIFT) & 0xf,
+        (v.a >> FRAC_Y_SHIFT) & 0xf,
+        (v.b >> FRAC_Z_SHIFT) & 0xf,
+    )
 }
 
 pub fn with_lowered(mut vertex: ChunkVertex, lowered: bool) -> ChunkVertex {
@@ -72,5 +109,18 @@ mod tests {
             )),
             input
         );
+    }
+
+    #[test]
+    fn vertex_fraction_pack_roundtrip() {
+        let v = pack_with_fraction(7, 8, 9, 1, 7, 15, 2, 3, 4, 5, 6);
+        assert_eq!(unpack(v), (7, 8, 9, 2, 3, 4, 5, 6));
+        assert_eq!(unpack_fraction(v), (1, 7, 15));
+    }
+
+    #[test]
+    fn cube_vertices_keep_zero_fraction() {
+        let v = pack(31, 31, 31, 5, 2, 3, 4, 5);
+        assert_eq!(unpack_fraction(v), (0, 0, 0));
     }
 }

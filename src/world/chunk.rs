@@ -20,6 +20,7 @@ pub fn sky_light(packed: u8) -> u8 {
     (packed & SKY_LIGHT_MASK) >> 4
 }
 
+#[derive(Clone)]
 pub struct Chunk {
     pub(crate) blocks: Box<[BlockId; CHUNK_VOLUME]>,
     pub(crate) non_air: u32,

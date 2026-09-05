@@ -3868,3 +3868,1914 @@ VF_PRESET=balanced VF_AUTOPILOT=stream VF_BENCH_FRAMES=3600 \
 * MetalFX → 구현하지 않음. `wgpu-hal` 인터롭과 `unsafe`가 필요하므로 현재 절대 규칙과 맞지 않는다.
 * 비큐브 TORCH, 인벤토리, 서바이벌, 멀티플레이, 모드 API, 리플레이, 게임패드, 크로스플랫폼 번들 → 하지 않음.
 * M10이 끝나면 LOG 기록 후 멈추고 Claude 최종 리뷰를 받는다.
+## 20. M6 이후 통합 보강 설계 — M7~M10 무중단 실행·M5 Air High·크리에이티브 건축 UX
+
+확정 시점은 M6 구현·리뷰·커밋 이후다. 이 절은 §16~§19를 삭제하지 않고 보강한다. 같은 항목이 충돌하면 **§20의 수치·계약·진행 방식이 우선**한다. §1 D1~D18, §12, §14.11~§14.12, §15의 M6 조명 계약은 바꾸지 않는다.
+
+M7부터 M10까지는 하나의 연속 구현 구간이다. M7·M8·M9 종료 시 검증과 LOG 기록은 하되 사람 리뷰를 기다리지 않는다. M10 최종 검증 뒤에만 멈춘다. 중간 마일스톤의 검증이 실패하면 그 자리에서 원인을 수정하고 같은 검증을 다시 통과시킨 뒤 다음 단계로 간다.
+
+### 20.1 최종 제품 목표와 고정 범위
+
+M10 완료 시 다음이 동시에 성립해야 한다.
+
+1. 2560×1440 물리 출력의 Apple M5 팬리스 MacBook Air에서 기본 `m5_air_high` 프리셋이 60fps 목표를 지킨다.
+2. 오프스크린 HDR·PBR G버퍼·CSM·GTAO·대기·TAAU·블룸·자동 노출·고품질 물·볼류메트릭 포그·볼류메트릭 구름·LOD·컴퓨트 DDA GI가 하나의 프레임 그래프로 동작한다.
+3. `I`로 크리에이티브 인벤토리를 열고 122개 건축 아이템을 검색·분류·핫바 배치할 수 있다.
+4. 큐브뿐 아니라 통나무 축, 반블록, 계단, 유리판, 울타리를 배치·파괴·선택할 수 있다.
+5. 화면 오른쪽 아래에 1인칭 손과 선택 아이템이 보이고, 걷기·파괴·설치·아이템 전환 애니메이션이 결정적으로 동작한다.
+6. 설정·핫바가 저장되고, 스크린샷·사운드·셰이더팩·`.app` 번들이 동작한다.
+7. 모든 완료 판정은 테스트·로그·PNG 픽셀·GPU/CPU 수치로 자동 검증된다.
+
+하지 않는 것:
+
+- 도어, 트랩도어, 사다리, 레드스톤, 상자 인벤토리, 아이템 수량, 제작, 생존, 몹, 멀티플레이.
+- 곡면 블록, 임의 회전 메시, glTF 모델, 스킨 편집기.
+- MetalFX, `wgpu-hal`, 하드웨어 레이트레이싱, Metal acceleration structure.
+- 자동 동적 해상도. 프리셋은 사용자가 고르고 실행 중 몰래 바뀌지 않는다.
+
+### 20.2 M5 Air High 렌더 품질 계약
+
+#### 20.2.1 프리셋
+
+`m5_air_high`가 모든 첫 실행의 기본값이다. 대상 제품이 Apple M5용이므로 adapter 이름으로 품질을 자동 하향하지 않는다. `AdapterInfo`는 LOG와 진단에만 기록한다. 사용자가 저장한 설정이 있으면 저장값이 우선한다.
+
+| 항목 | performance | balanced | m5_air_high 기본 | cinematic |
+|---|---:|---:|---:|---:|
+| render scale | 0.58 | 0.67 | 0.72 | 1.00 |
+| TAAU | on | on | on | on |
+| sharpen | 0.12 | 0.16 | 0.18 | 0.12 |
+| CSM 해상도 | 1536 | 1792 | 2048 | 2048 |
+| shadow PCF tap | 8 | 8 | 12 | 20 |
+| shadow distance | 160 | 192 | 224 | 256 |
+| GTAO 방향×step | 4×3 | 6×3 | 8×4 | 8×6 |
+| POM step+refine | off | 6+2 | 8+2 | 16+3 |
+| SSR step+refine | 24+4 | 32+5 | 40+5 | 64+6 |
+| volumetric view step | 24 | 28 | 32 | 48 |
+| cloud view/light step | 28/4 | 32/5 | 40/6 | 64/8 |
+| GI ray/pixel | 2 | 3 | 4 | 6 |
+| GI max distance | 32 | 40 | 48 | 64 |
+| bloom level | 4 | 5 | 6 | 6 |
+| full-detail radius | 8 | 9 | 10 | 12 |
+
+`cinematic`은 자동 스냅샷과 정지 장면용이다. 60fps 완료 조건은 `m5_air_high`에만 적용한다.
+
+내부 렌더 크기는 출력 종횡비를 보존하며 높이에서 계산한다.
+
+```text
+internal_h = max(8, round(output_h * scale / 8) * 8)
+internal_w = max(8, round((internal_h * output_w / output_h) / 8) * 8)
+```
+
+2560×1440, scale 0.72의 계약값은 1848×1040이다. 스냅샷 기본은 명시하지 않으면 `m5_air_high`; 렌더 패스의 픽셀 기준 검증은 항상 `--render-scale 1.0`과 고정 노출을 명시한다.
+
+#### 20.2.2 프레임 그래프
+
+M10 최종 순서는 다음으로 고정한다.
+
+```text
+00 clipmap CPU 결과 적용·GPU slab upload
+01 CSM cascade update 선택·shadow draw
+02 opaque/cutout G-buffer
+03 linear-depth pyramid
+04 half-res GTAO raw
+05 GTAO spatial+temporal
+06 atmosphere LUT 갱신 선택
+07 deferred PBR + sky → internal HDR
+08 quarter-res voxel GI trace
+09 GI temporal + à-trous
+10 GI composite → internal HDR
+11 quarter-res volumetric fog/light
+12 quarter-res volumetric clouds
+13 cloud/fog temporal + depth-aware composite
+14 HDR scene copy
+15 distance-sorted GLASS/WATER forward list; WATER samples immutable opaque-HDR copy
+16 selection outline
+17 internal bloom pyramid
+18 average log luminance + exposure
+19 native-resolution TAAU HDR reconstruction of `internal HDR + bloom`
+20 ACES + color grade + sharpen → native LDR
+21 native-resolution first-person hand/viewmodel
+22 modal background blur when inventory/pause is open
+23 native-resolution HUD/inventory/pause UI
+24 optional screenshot copy
+25 present copy to caller output view
+```
+
+`Renderer`는 여전히 `Surface`와 `Window`를 모른다. 25번 present copy의 대상은 호출자가 넘긴 `TextureView`다.
+
+#### 20.2.3 WGSL·GPU 최적화 계약
+
+- 모든 render/compute pipeline, bind-group layout, sampler, texture view는 init 또는 resize/settings change 때만 만든다. frame loop에서 생성 금지.
+- 단순 image kernel(depth mip, bloom, exposure reduction)은 `@workgroup_size(16,16,1)`. depth/normal 의존 분기(GTAO, TAAU, water, volumetric, cloud, GI)는 `@workgroup_size(8,8,1)`.
+- workgroup shared memory는 GTAO/TAAU의 10×10 depth/normal tile에만 사용하고 group당 16KiB 이하.
+- shader loop의 최대 반복은 preset uniform이 아니라 compile-time upper bound로 고정하고 `if i>=active_steps { break; }`를 쓴다. upper bound: POM16, contact8, GTAO48, SSR64, volumetric48, cloud64, cloud-light8, GI ray6, DDA96, à-trous25 taps.
+- `textureDimensions`를 fragment마다 호출하지 않는다. inverse dimensions를 uniform에 둔다.
+- 동일 pixel에서 같은 texture/UV를 두 번 sample하지 않는다. albedo/material/emission 결과를 local variable에 유지한다.
+- fullscreen triangle은 vertex buffer 없이 `vertex_index` 0..2로 만든다.
+- f16은 필수 feature로 요청하지 않는다. 모든 필수 경로는 f32다. `SHADER_F16` 전용 변형은 M10 범위 밖이다.
+- NaN 방지: normalize 입력 길이 최소 `1e-8`, division denominator 최소 `1e-4`, `pow` base 0 이상, log luminance 최소 `1e-4`.
+- frame당 `queue.write_buffer`는 Globals 1회, dirty chunk-uniform 연속 range 최대 1회, pass uniform ring 최대 1회로 batch한다.
+- `Vec`/`HashMap` scratch는 Renderer 필드에서 재사용한다. global allocator hook은 `unsafe`가 필요하므로 쓰지 않는다. 대신 모든 renderer-owned scratch collection을 `TrackedScratch<T>`로 감싸 capacity 증가 때 `cpu_capacity_growths`를, GPU buffer/texture/bind-group/pipeline 생성 때 `gpu_resource_creations`를 증가시킨다. `VF_ALLOC_STATS=1` 600 steady frames에서 두 값의 합은 중앙값 0, p95 0이어야 한다.
+- resource label은 `vf/<milestone>/<module>/<name>` 형식으로 붙인다. validation error에 unlabeled resource가 없어야 한다.
+
+`m5_air_high` 최대 texture/comparison sample 수의 정적 상한:
+
+| pass | pixel당 최대 sample |
+|---|---:|
+| G-buffer POM 포함 | 13 |
+| CSM+contact | 20 |
+| GTAO raw | 34 |
+| deferred | 9 |
+| TAAU current/history/clamp | 30 |
+| WATER SSR/refraction | 52 |
+| volumetric | 48 |
+| cloud | 64 view + 48 light-density |
+| GI | 4 rays×96 occupancy fetch 상한 |
+
+### 20.3 M7 보강 — 재질 배열·PBR·GTAO·TAAU
+
+#### 20.3.1 새 모듈
+
+| 경로 | 역할 |
+|---|---|
+| `src/render/materials.rs` | albedo/material/emission `texture_2d_array`, 재질 LUT, 절차 재질 생성 |
+| `src/render/pbr.rs` | CPU 참조 GGX·oct normal·POM 상수와 테스트 |
+| `src/render/depth_pyramid.rs` | linear depth mip compute |
+| `src/render/gtao.rs` | GTAO raw·spatial·temporal |
+| `src/render/taau.rs` | native HDR history, reprojection, YCoCg clamp, sharpen 입력 |
+| `src/render/atmosphere.rs` | transmittance·multi-scatter·sky-view LUT와 sky cubemap |
+| `assets/shaders/gbuffer.wgsl` | normal map·POM·motion/reactive 출력 |
+| `assets/shaders/gtao.wgsl` | horizon GTAO·temporal |
+| `assets/shaders/taau.wgsl` | native 해상도 TAAU |
+| `assets/shaders/pbr_common.wgsl` | GGX·oct·색공간 공통 함수. 텍스트 include는 없으므로 빌드 시 Rust가 문자열 결합 |
+
+`main.rs`, `stream.rs`, `renderer.rs`가 500줄에 닿기 전에 하위 모듈로 분리한다. shader source 결합은 `shader_source.rs` 한 곳에서 `pbr_common.wgsl + pass.wgsl` 순서로 한다. 임의 include 문법을 WGSL에 만들지 않는다.
+
+#### 20.3.2 재질 텍스처 배열
+
+D6을 유지하며 세 배열 모두 같은 layer 순서와 16×16 크기를 쓴다. 정점의 기존 `tex: u16`이 곧 material-layer ID다. 모든 face별 재질은 `BlockDef.textures[face]`로 선택하고 deferred의 `MaterialGpu`도 이 layer ID로 인덱스한다. material layer hard cap은 256이며 M10 builtin layer 수는 128 이하로 유지한다.
+
+| 배열 | 포맷 | 채널 |
+|---|---|---|
+| albedo | `Rgba8UnormSrgb` | RGB base color, A cutout/translucency mask |
+| material | `Rgba8Unorm` | RG tangent normal XY, B roughness, A height |
+| emission | `R8Unorm` | texel emission mask |
+
+모든 배열은 `texture_2d_array`, mip level은 5개(16,8,4,2,1)다. mip은 CPU box filter로 결정적으로 만든다. alpha-cutout mip의 alpha는 평균이 아니라 coverage-preserving threshold 보정으로 만든다. 원본 layer의 `alpha >= 0.5` coverage와 각 mip coverage 차이는 3%p 이하다.
+
+`MaterialGpu`:
+
+```rust
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct MaterialGpu {
+    pub base: [f32; 4],      // metallic, normal_strength, height_scale, emission_strength
+    pub tint: [f32; 4],      // emission tint rgb, alpha_cutoff
+    pub flags: [u32; 4],     // bit0 POM, bit1 cutout, bit2 translucent, bit3 double_sided
+}
+```
+
+G버퍼의 A 채널에서 복원한 material-layer ID는 `u32(round(a*255.0))`다. `MaterialGpu`, emission tint, flags는 이 ID로 조회한다. 범위 밖이면 `STONE_MATERIAL_LAYER = def(STONE).textures[0]`를 사용한다.
+
+POM은 full cube의 opaque/cutout face에서만 쓴다. slab/stair/pane/fence, WATER, GLASS, LEAVES에는 쓰지 않는다.
+
+```text
+view_ts = tangent-space view direction
+layers = preset step count
+layer_depth = 1/layers
+uv_delta = view_ts.xy / max(abs(view_ts.z), 0.20)
+         * material.height_scale / layers
+```
+
+높이 맵 A는 0=깊은 홈, 1=표면이다. 현재 layer depth가 `1-height(uv)`를 처음 넘은 지점에서 멈추고, 앞·뒤 두 샘플을 선형 보간한 뒤 지정된 refine 횟수만큼 이분 탐색한다. UV 변위 절댓값은 각 축 0.08 이하로 clamp한다. 시선 `N·V < 0.15`, 선형 depth >48, derivative footprint >0.25 texel이면 POM을 끄고 원 UV를 쓴다.
+
+normal map은 height의 toroidal Sobel로 생성한다.
+
+```text
+dx = (h(x+1,y-1)+2h(x+1,y)+h(x+1,y+1)
+    - h(x-1,y-1)-2h(x-1,y)-h(x-1,y+1)) / 8
+dy = 같은 방식의 y 미분
+n = normalize((-dx*normal_strength, -dy*normal_strength, 1))
+RG = n.xy*0.5+0.5
+```
+
+#### 20.3.3 G버퍼
+
+| 타깃 | 포맷 | 내용 |
+|---|---|---|
+| `gbuffer_albedo` | `Rgba8UnormSrgb` | RGB albedo, A metallic |
+| `gbuffer_normal` | `Rgba16Float` | RG world oct normal, B roughness, A emission strength |
+| `gbuffer_light` | `Rgba8Unorm` | R block light/15, G sky/15, B vertex AO/3, A material-layer ID/255 |
+| `gbuffer_motion` | `Rg16Float` | current UV - previous UV |
+| `gbuffer_reactive` | `R8Unorm` | cutout/emissive/animation history 감쇠 마스크 |
+| `depth` | `Depth32Float` | 표준 Z |
+
+motion은 jitter를 제거한 현재·이전 clip 좌표로 계산한다. 새로 생성된 청크, teleport, resize, shaderpack swap, render-scale 변경은 해당 픽셀 motion=0, reactive=1로 둔다. reactive target은 프레임 시작에 0으로 clear하고 G-buffer cutout/emissive가 `max(alpha_edge, emission_mask)`를 쓴다. forward GLASS는 `max(old, alpha*0.75)`, WATER는 `max(old, 0.60+0.40*foam)`, outline은 1.0을 쓴다. 여러 pass가 같은 픽셀을 덮을 때 blend operation은 `Max`다.
+
+#### 20.3.4 PBR 직접광·환경광
+
+직접광은 Cook–Torrance GGX다.
+
+```text
+a = max(roughness², 0.0025)
+a2 = a²
+D = a2 / (π * ((NdotH²*(a2-1)+1)²))
+k = (roughness+1)² / 8
+G1(x) = x / (x*(1-k)+k)
+G = G1(NdotV)*G1(NdotL)
+F0 = mix(vec3(0.04), albedo, metallic)
+F = F0 + (1-F0)*(1-VdotH)^5
+specular = D*G*F / max(4*NdotV*NdotL, 1e-4)
+diffuse = (1-F)*(1-metallic)*albedo/π
+direct = (diffuse+specular) * sun_radiance * NdotL * shadow * sky_visibility
+```
+
+금속값:
+
+- GOLD_BLOCK 1.0
+- METAL_PANEL 0.90
+- RUSTED_METAL 0.75
+- COPPER, WEATHERED_COPPER 0.90
+- 나머지 0.0
+
+sky specular는 64×64×6 `Rgba16Float` cubemap 7 mip을 쓴다. mip 0은 sky-view LUT에서 생성하고, 다음 mip은 2×2 box filter다. `lod = roughness²*6`. diffuse ambient는 `sample_sky(normal)*0.22 + zenith_color*0.08`이다. M6 block light ambient는 warm tint `(1.0,0.58,0.28)`를 쓴다. M9 GI가 켜지면 이 ambient는 유지하되 GI가 추가된다.
+
+#### 20.3.5 CSM 업데이트 cadence와 contact shadow
+
+§16의 3 cascade와 PSSM을 유지하되 `m5_air_high` split far는 224다. split은 런타임에 같은 PSSM λ=0.65 식으로 계산한다.
+
+업데이트:
+
+- cascade 0: 매 프레임.
+- cascade 1: 짝수 프레임 또는 카메라 2블록 이동 또는 태양 방향 0.25° 변화.
+- cascade 2: `frame_index % 4 == 0` 또는 카메라 8블록 이동 또는 태양 방향 0.50° 변화.
+- 청크 edit가 cascade 범위 안이면 해당 cascade를 즉시 갱신.
+
+PCF는 고정 Poisson disk를 회전해 쓴다. `m5_air_high` 12 tap, 회전각은 64² blue-noise와 frame index 0..7로 정하며 TAAU가 누적한다. receiver bias 0.0008, normal offset 0.025는 유지한다.
+
+screen-space contact shadow:
+
+- internal half-resolution.
+- 태양 방향으로 view-space 최대 2.5블록.
+- 8 step.
+- thickness 0.06+0.0015*depth.
+- CSM shadow에 `min`으로 결합.
+- Performance에서는 off, 나머지는 on.
+
+#### 20.3.6 GTAO
+
+Crytek SSAO 대신 XeGTAO 계열 horizon search를 쓴다.
+
+- half-resolution.
+- radius 1.5블록.
+- falloff start 0.6*radius.
+- thickness 0.20.
+- 방향·step은 프리셋 표.
+- 각 방향은 blue-noise로 회전.
+- depth discontinuity absolute 0.5 또는 relative 2%에서 history reject.
+- normal dot <0.85에서 reject.
+- temporal history 0.90 static, 0.75 motion >1px.
+- spatial bilateral 5×5 separable, depth sigma 0.75, normal power 32.
+
+출력은 `R8Unorm`, 1=unoccluded다. deferred에서는 ambient와 GI에만 곱하고 direct·emission에는 곱하지 않는다.
+
+#### 20.3.7 대기와 sky LUT
+
+기법은 Hillaire 2020 계열 LUT 분해를 단순화해 사용한다.
+
+| LUT | 크기·포맷 | 갱신 |
+|---|---|---|
+| transmittance | 256×64 `Rgba16Float` | 시작·계수 변경 시 |
+| multiscatter | 32×32 `Rgba16Float` | transmittance 뒤 |
+| sky view | 192×108 `Rgba16Float` | 8프레임마다 또는 phase 0.0005 변화 |
+| sky cubemap | 64²×6, 7 mip `Rgba16Float` | sky view 갱신 뒤 |
+
+대기 상수는 §16의 지구/대기 반경, βR, βM, 높이척도, Mie g를 유지한다. LUT 좌표는 다음으로 고정한다.
+
+```text
+h = clamp((r-R_ground)/(R_atmosphere-R_ground),0,1)
+mu = dot(ray, radial_up)
+transmittance uv = ((mu+1)*0.5, sqrt(h))
+multiscatter uv = ((sun_mu+1)*0.5, sqrt(h))
+sky-view u = fract(atan2(dir.z,dir.x)/(2π)+0.5)
+sky-view v = clamp(0.5-asin(dir.y)/π,0,1)
+```
+
+ray-sphere 교점은 작은 양의 해를 선택하고, ground를 먼저 맞으면 적분을 그 지점에서 끝낸다. transmittance는 40 step, multiscatter는 texel당 16방향×8 step, sky view는 24 view step×8 sun step이다. multiscatter 보정은 `single_scatter + multiscatter * (1-transmittance)`로 합친다. 모든 LUT 값은 finite·0 이상이어야 한다.
+
+#### 20.3.8 TAAU
+
+TAAU는 M7 필수다. native 해상도 `Rgba16Float` history 두 장, previous native linear depth `R32Float`, normal `Rg16Float`를 사용한다.
+
+8-frame Halton jitter는 다음 순서를 반복한다.
+
+```text
+( 0.0000000,-0.1666667)
+(-0.2500000, 0.1666667)
+( 0.2500000,-0.3888889)
+(-0.3750000,-0.0555556)
+( 0.1250000, 0.2777778)
+(-0.1250000,-0.2777778)
+( 0.3750000, 0.0555556)
+(-0.4375000, 0.3888889)
+```
+
+jitter clip offset는 `(2*jitter.x/internal_w, -2*jitter.y/internal_h)`다.
+
+exposure reduction은 bloom을 더하기 전 internal HDR만 샘플한다. TAAU 현재 색 입력은 `internal_hdr + bloom*intensity`이며 scene-referred HDR라 exposure 변화의 영향을 history에 축적하지 않는다. 현재 샘플은 native pixel의 jittered 위치에서 16-tap Catmull–Rom으로 재구성한다. history UV는 motion을 빼서 구한다. native current depth·normal·material-layer history는 같은 UV에서 가장 가까운 internal point sample을 선택해 기록하고, motion/reactive는 bilinear sample한다.
+
+reject:
+
+- history UV outside.
+- absolute depth diff >0.50.
+- relative depth diff >0.02.
+- normal dot <0.90.
+- material-layer ID 변화.
+- reactive >=0.95.
+- resize, scale, teleport >8블록, FOV 변화 >1°, shaderpack swap.
+
+YCoCg neighborhood clamp:
+
+1. internal current 3×3을 YCoCg로 변환.
+2. min/max와 평균·표준편차를 구한다.
+3. 허용 범위는 `max(min, mean-1.25σ)`부터 `min(max, mean+1.25σ)`.
+4. history를 범위에 clamp.
+
+history weight:
+
+```text
+motion_px = length(motion * output_size)
+w_motion = mix(0.92, 0.78, saturate(motion_px/8))
+w = w_motion * (1 - 0.80*reactive)
+output = mix(current, history_clamped, w)
+```
+
+hand와 UI는 TAAU 뒤에 그려 history에 들어가지 않는다.
+
+#### 20.3.9 톤매핑·색 보정·샤픈
+
+ACES fitted는 §16 식을 유지한다. 그 뒤 선형 공간에서 다음을 적용한다.
+
+```text
+contrast pivot = 0.18
+contrast = 1.06
+saturation = 1.04
+lift = -0.003
+gain = 1.01
+```
+
+샤픈은 native LDR의 5-tap unsharp다.
+
+```text
+blur = (N+S+E+W+4*C)/8
+sharp = clamp(C + amount*(C-blur), min(N,S,E,W,C), max(N,S,E,W,C))
+```
+
+amount는 프리셋 표다. UI·hand에는 적용하지 않는다.
+
+#### 20.3.10 M7 성능 예산
+
+Apple M5, 2560×1440, `m5_air_high`, R=10, 정착 후 GPU p95:
+
+| 패스 | p95 |
+|---|---:|
+| CSM+contact | 2.00ms |
+| G-buffer+POM | 1.75ms |
+| depth pyramid | 0.20ms |
+| GTAO 전체 | 0.90ms |
+| atmosphere 갱신 상각 | 0.20ms |
+| deferred PBR | 1.20ms |
+| bloom+exposure | 0.75ms |
+| TAAU+ACES+sharpen | 1.10ms |
+| M7 GPU 합계 | 8.10ms |
+
+M7 종료 시 p95 전체 프레임 ≤12.5ms, max <25ms다. 실패하면 품질 수치를 낮추지 말고 다음 순서로 최적화한다.
+
+1. bind group·pipeline 전환 제거.
+2. far cascade cadence 확인.
+3. LUT 불필요 갱신 제거.
+4. fullscreen pass 합치기.
+5. storage texture read/write 중복 제거.
+6. CPU draw list·uniform write batch.
+
+### 20.4 M8 보강 — 고품질 물·볼류메트릭·구름
+
+#### 20.4.1 물
+
+§17의 네 Gerstner 파동을 유지한다. 다음을 추가한다.
+
+- linear-depth pyramid를 SSR에 사용.
+- `m5_air_high`: 40 coarse step + 5 binary refine, max 48블록.
+- 첫 8 step은 mip0, 이후 projected footprint에 따라 mip 1..5.
+- hit confidence는 edge·distance·normal facing·depth residual 네 항의 곱.
+- residual >thickness면 miss.
+- SSR miss는 sky cubemap roughness mip.
+
+shore foam:
+
+```text
+shore = 1-smoothstep(0.15,1.25,water_thickness)
+crest = smoothstep(0.06,0.13,abs(gerstner_height_delta))
+noise = smoothstep(0.45,0.70,fbm(world_xz*0.35 + time*vec2(0.08,0.04)))
+foam = saturate(shore*0.85 + crest*0.45) * noise
+```
+
+foam color `(0.80,0.92,0.95)`, roughness 0.85. water는 replacement pass, depth write off를 유지한다.
+
+수중:
+
+- camera eye가 WATER 셀 안이면 `underwater=1`.
+- 최대 시야 64블록.
+- absorption `(0.16,0.065,0.028)`.
+- scattering `(0.015,0.12,0.18)`.
+- distortion `0.0025*sin(uv.y*90+time*1.6)`.
+- volumetric density 3배.
+- UI·hand는 tint하지 않는다.
+
+#### 20.4.2 볼류메트릭 포그/라이트
+
+quarter-resolution, checkerboard 2×2다. 한 프레임에 parity `(frame_index&1, (frame_index>>1)&1)` 픽셀만 full march하고 나머지는 history reprojection한다. 4프레임 안에 전 픽셀이 갱신된다.
+
+`m5_air_high`:
+
+- 32 view step.
+- 최대 224블록.
+- HG g=0.65.
+- CSM sample은 2 step마다 한 번, 중간 step은 선형 보간.
+- local TORCH fog glow는 가장 가까운 8개 광원만 CPU에서 uniform 배열로 전달하고, 거리 16블록에서 0.
+- temporal static weight 0.93, motion >2px 0.80.
+
+#### 20.4.3 구름과 구름 그림자
+
+§17 Perlin–Worley를 유지한다. `m5_air_high`는 quarter-resolution checkerboard, 40 view step, 6 light step다.
+
+cloud shadow map:
+
+- 512×512 `R8Unorm`.
+- 카메라 중심 1024×1024블록 정사영.
+- texel 2블록.
+- 8프레임마다 또는 카메라 16블록 이동 시 갱신.
+- 태양 방향으로 cloud layer를 12 step 적분.
+- terrain direct sun에 `mix(0.55,1.0,shadow)`를 곱한다.
+- 32블록 이동 단위로 shadow map origin을 snap한다.
+
+#### 20.4.4 M8 성능 예산
+
+| 패스 | `m5_air_high` p95 |
+|---|---:|
+| WATER+SSR | 1.20ms |
+| volumetric fog | 0.85ms |
+| clouds | 1.05ms |
+| cloud shadow 상각 | 0.15ms |
+| LOD 추가 draw | 0.45ms |
+| M8 추가 합계 | 3.70ms |
+| M7+M8 GPU 합계 | ≤11.8ms |
+| 전체 프레임 p95 | ≤15.0ms |
+
+### 20.5 M9 보강 — GI 품질·스케줄
+
+§18의 4×128³ clipmap, WGSL compute DDA, 하드웨어 RT 금지를 유지한다.
+
+`m5_air_high` 고정값:
+
+- quarter-resolution.
+- pixel당 4 cosine ray.
+- ray max 48블록.
+- ray당 max 96 crossing.
+- temporal history 0.90.
+- à-trous 3단계 1,2,4.
+- intensity 0.65.
+
+추가 스케줄:
+
+- clipmap upload는 프레임당 4MiB hard cap.
+- level 0/1 slab가 있으면 2/3보다 우선.
+- 카메라 속도 >12 blocks/s이면 level 0의 ray max를 32로 줄이지 않는다. 대신 upload backlog를 허용하고 ready mask로 coarse level fallback한다.
+- GI trace는 checkerboard하지 않는다. quarter-resolution 모든 픽셀을 매 프레임 계산한다.
+- TORCH, GLOWSTONE, SEA_LANTERN, WARM_LAMP, COLD_LAMP, GLOW_PANEL의 RGB emission을 clipmap light에 기록한다.
+
+| 블록 | RGB radiance |
+|---|---|
+| TORCH | `(8.0,3.36,0.96)` |
+| GLOWSTONE | `(6.0,3.4,1.5)` |
+| SEA_LANTERN | `(3.0,5.5,6.5)` |
+| WARM_LAMP | `(8.0,4.4,1.8)` |
+| COLD_LAMP | `(4.5,6.5,8.0)` |
+| GLOW_PANEL | `(6.5,6.8,7.0)` |
+
+M6 flood-fill emission level은 TORCH 14, GLOWSTONE·SEA_LANTERN·WARM_LAMP·COLD_LAMP·GLOW_PANEL 15다. 나머지는 0이다.
+
+M9 추가 GPU p95는 3.2ms, M7~M9 전체 GPU p95는 15.0ms 이하, 전체 프레임 p95는 16.6ms 이하, max는 25ms 미만이다.
+
+### 20.6 M10 크리에이티브 건축 시스템 — 블록·아이템·형상
+
+M10의 최우선은 배포 스크립트가 아니라 건축 UX다. 순서는 「레지스트리·형상 → 메시·물리·레이캐스트 → I 인벤토리·아이콘 → 손·상호작용 → 설정·사운드·셰이더팩·번들」이다.
+
+#### 20.6.1 새 모듈
+
+| 경로 | 역할 |
+|---|---|
+| `src/world/material.rs` | 재질 ID·절차 texture recipe·PBR 계수 |
+| `src/world/shape.rs` | 1/16 occupancy, AABB, boundary coverage, cached template |
+| `src/world/catalog.rs` | 안정된 BlockId·ItemId·카테고리·배치 규칙 |
+| `src/world/connect.rs` | pane/fence 연결 mask 재계산 |
+| `src/mesh/shaped.rs` | partial-neighbor face subtraction·template emission |
+| `src/player/place.rs` | slab merge·stair facing·axis log·connection placement |
+| `src/player/pick.rs` | middle-click block → ItemId |
+| `src/ui/inventory.rs` | I 창 상태·검색·카테고리·scroll·hotbar assignment |
+| `src/ui/item_icons.rs` | 122개 64² icon array bake·cache |
+| `src/render/viewmodel.rs` | 1인칭 손·held item·애니메이션 |
+| `src/gameplay/interaction_anim.rs` | swing/place/switch state machine |
+| `assets/shaders/item_icon.wgsl` | 고정 isometric item icon |
+| `assets/shaders/viewmodel.wgsl` | native LDR viewmodel PBR·ACES |
+| `assets/shaders/ui_blur.wgsl` | inventory/pause 배경 blur |
+
+#### 20.6.2 BlockId 안정 레지스트리
+
+0~12는 M6 값을 그대로 유지한다. 아래 ID는 save compatibility 계약이다. 이름을 바꾸거나 순서를 재배치하지 않는다.
+
+```text
+  0 AIR
+  1 STONE
+  2 DIRT
+  3 GRASS
+  4 SAND
+  5 WATER
+  6 OAK_LOG_Y              // 기존 LOG alias
+  7 OAK_LEAVES             // 기존 LEAVES alias
+  8 OAK_PLANKS             // 기존 PLANKS alias
+  9 CLEAR_GLASS            // 기존 GLASS alias
+ 10 RED_BRICK              // 기존 BRICK alias
+ 11 COBBLESTONE            // 기존 COBBLE alias
+ 12 TORCH
+ 13 DIRT_PATH
+ 14 GRAVEL
+ 15 RED_SAND
+ 16 CLAY
+ 17 MUD
+ 18 SNOW
+ 19 MOSS
+ 20 POLISHED_STONE
+ 21 STONE_BRICKS
+ 22 MOSSY_STONE_BRICKS
+ 23 CHISELED_STONE
+ 24 SLATE
+ 25 POLISHED_SLATE
+ 26 BASALT
+ 27 POLISHED_BASALT
+ 28 LIMESTONE
+ 29 LIMESTONE_BRICKS
+ 30 MARBLE
+ 31 MARBLE_TILES
+ 32 SANDSTONE
+ 33 CUT_SANDSTONE
+ 34 RED_SANDSTONE
+ 35 QUARTZ
+ 36 QUARTZ_TILES
+ 37 OBSIDIAN
+ 38 BIRCH_LOG_Y
+ 39 SPRUCE_LOG_Y
+ 40 DARK_OAK_LOG_Y
+ 41 BIRCH_PLANKS
+ 42 SPRUCE_PLANKS
+ 43 DARK_OAK_PLANKS
+ 44 BIRCH_LEAVES
+ 45 SPRUCE_LEAVES
+ 46 DARK_OAK_LEAVES
+ 47 BOOKSHELF
+ 48 CRATE
+ 49 BARREL
+ 50 HAY_BALE
+ 51 WHITE_CONCRETE
+ 52 LIGHT_GRAY_CONCRETE
+ 53 GRAY_CONCRETE
+ 54 BLACK_CONCRETE
+ 55 BROWN_CONCRETE
+ 56 RED_CONCRETE
+ 57 ORANGE_CONCRETE
+ 58 YELLOW_CONCRETE
+ 59 LIME_CONCRETE
+ 60 GREEN_CONCRETE
+ 61 CYAN_CONCRETE
+ 62 LIGHT_BLUE_CONCRETE
+ 63 BLUE_CONCRETE
+ 64 PURPLE_CONCRETE
+ 65 MAGENTA_CONCRETE
+ 66 PINK_CONCRETE
+ 67 WHITE_GLASS
+ 68 RED_GLASS
+ 69 GREEN_GLASS
+ 70 CYAN_GLASS
+ 71 BLUE_GLASS
+ 72 GLOWSTONE
+ 73 SEA_LANTERN
+ 74 WARM_LAMP
+ 75 COLD_LAMP
+ 76 GLOW_PANEL
+ 77 ROOF_TILE
+ 78 CHECKER_TILE
+ 79 CERAMIC_TILE
+ 80 METAL_PANEL
+ 81 RUSTED_METAL
+ 82 COPPER
+ 83 WEATHERED_COPPER
+ 84 GOLD_BLOCK
+ 85 PRISMARINE
+ 86 DARK_PRISMARINE
+ 87 ICE
+ 88 PACKED_ICE
+```
+
+상태 ID 범위:
+
+```text
+128 OAK_LOG_X
+129 OAK_LOG_Z
+130 BIRCH_LOG_X
+131 BIRCH_LOG_Z
+132 SPRUCE_LOG_X
+133 SPRUCE_LOG_Z
+134 DARK_OAK_LOG_X
+135 DARK_OAK_LOG_Z
+
+SLAB_BASE = 256
+  material_index 0..11, state 0=bottom, 1=top
+  id = 256 + material_index*2 + state
+
+STAIR_BASE = 512
+  material_index 0..11
+  facing 0=North(-Z), 1=East(+X), 2=South(+Z), 3=West(-X)
+  state = facing | (upside_down ? 4 : 0)
+  id = 512 + material_index*8 + state
+
+PANE_BASE = 768
+  material_index 0..5
+  mask bits: North=1, East=2, South=4, West=8
+  id = 768 + material_index*16 + mask
+
+FENCE_BASE = 896
+  material_index 0..3
+  mask bits: North=1, East=2, South=4, West=8
+  id = 896 + material_index*16 + mask
+```
+
+ID 89~127, 136~255, 280~511, 608~767, 864~895, 960 이상은 현재 예약이다. 범위 밖 `def()`는 AIR를 반환하는 기존 계약을 유지한다.
+
+slab/stair material_index:
+
+```text
+0 STONE
+1 STONE_BRICKS
+2 COBBLESTONE
+3 SLATE
+4 MARBLE
+5 LIMESTONE_BRICKS
+6 SANDSTONE
+7 RED_BRICK
+8 OAK_PLANKS
+9 BIRCH_PLANKS
+10 SPRUCE_PLANKS
+11 DARK_OAK_PLANKS
+```
+
+pane material_index:
+
+```text
+0 CLEAR_GLASS
+1 WHITE_GLASS
+2 RED_GLASS
+3 GREEN_GLASS
+4 CYAN_GLASS
+5 BLUE_GLASS
+```
+
+fence material_index:
+
+```text
+0 OAK_PLANKS
+1 BIRCH_PLANKS
+2 SPRUCE_PLANKS
+3 DARK_OAK_PLANKS
+```
+
+#### 20.6.3 ItemId와 122개 카탈로그
+
+`ItemId = u16`, 0은 EMPTY다. 블록 ID와 item ID가 같다고 가정하지 않는다.
+
+```rust
+pub type ItemId = u16;
+pub const EMPTY_ITEM: ItemId = 0;
+
+pub enum ItemCategory {
+    Terrain,
+    Masonry,
+    WoodNature,
+    Color,
+    GlassLight,
+    DetailUtility,
+    Shapes,
+}
+
+pub enum PlacementKind {
+    Block(BlockId),
+    AxisLog { y: BlockId, x: BlockId, z: BlockId },
+    Slab { material: u8, full: BlockId },
+    Stair { material: u8 },
+    Pane { material: u8 },
+    Fence { material: u8 },
+}
+
+pub struct ItemDef {
+    pub id: ItemId,
+    pub name: &'static str,
+    pub category: ItemCategory,
+    pub placement: PlacementKind,
+    pub icon_block: BlockId,
+    pub search_terms: &'static [&'static str],
+}
+```
+
+카탈로그 순서와 ID:
+
+```text
+Terrain
+  1 Grass             -> Block(3)
+  2 Dirt              -> Block(2)
+  3 Dirt Path         -> Block(13)
+  4 Stone             -> Block(1)
+  5 Cobblestone       -> Block(11)
+  6 Gravel            -> Block(14)
+  7 Sand              -> Block(4)
+  8 Red Sand          -> Block(15)
+  9 Clay              -> Block(16)
+ 10 Mud               -> Block(17)
+ 11 Snow              -> Block(18)
+ 12 Moss              -> Block(19)
+
+Masonry
+ 13 Polished Stone       -> Block(20)
+ 14 Stone Bricks         -> Block(21)
+ 15 Mossy Stone Bricks   -> Block(22)
+ 16 Chiseled Stone       -> Block(23)
+ 17 Slate                -> Block(24)
+ 18 Polished Slate       -> Block(25)
+ 19 Basalt               -> Block(26)
+ 20 Polished Basalt      -> Block(27)
+ 21 Limestone            -> Block(28)
+ 22 Limestone Bricks     -> Block(29)
+ 23 Marble               -> Block(30)
+ 24 Marble Tiles         -> Block(31)
+ 25 Sandstone            -> Block(32)
+ 26 Cut Sandstone        -> Block(33)
+ 27 Red Sandstone        -> Block(34)
+ 28 Quartz               -> Block(35)
+ 29 Quartz Tiles         -> Block(36)
+ 30 Obsidian             -> Block(37)
+
+WoodNature
+ 31 Oak Log        -> AxisLog{6,128,129}
+ 32 Birch Log      -> AxisLog{38,130,131}
+ 33 Spruce Log     -> AxisLog{39,132,133}
+ 34 Dark Oak Log   -> AxisLog{40,134,135}
+ 35 Oak Planks     -> Block(8)
+ 36 Birch Planks   -> Block(41)
+ 37 Spruce Planks  -> Block(42)
+ 38 Dark Oak Planks-> Block(43)
+ 39 Oak Leaves     -> Block(7)
+ 40 Birch Leaves   -> Block(44)
+ 41 Spruce Leaves  -> Block(45)
+ 42 Dark Oak Leaves-> Block(46)
+ 43 Bookshelf      -> Block(47)
+ 44 Crate          -> Block(48)
+ 45 Barrel         -> Block(49)
+ 46 Hay Bale       -> Block(50)
+
+Color
+ 47 White Concrete      -> Block(51)
+ 48 Light Gray Concrete -> Block(52)
+ 49 Gray Concrete       -> Block(53)
+ 50 Black Concrete      -> Block(54)
+ 51 Brown Concrete      -> Block(55)
+ 52 Red Concrete        -> Block(56)
+ 53 Orange Concrete     -> Block(57)
+ 54 Yellow Concrete     -> Block(58)
+ 55 Lime Concrete       -> Block(59)
+ 56 Green Concrete      -> Block(60)
+ 57 Cyan Concrete       -> Block(61)
+ 58 Light Blue Concrete -> Block(62)
+ 59 Blue Concrete       -> Block(63)
+ 60 Purple Concrete     -> Block(64)
+ 61 Magenta Concrete    -> Block(65)
+ 62 Pink Concrete       -> Block(66)
+
+GlassLight
+ 63 Clear Glass -> Block(9)
+ 64 White Glass -> Block(67)
+ 65 Red Glass   -> Block(68)
+ 66 Green Glass -> Block(69)
+ 67 Cyan Glass  -> Block(70)
+ 68 Blue Glass  -> Block(71)
+ 69 Glowstone   -> Block(72)
+ 70 Sea Lantern -> Block(73)
+ 71 Warm Lamp   -> Block(74)
+ 72 Cold Lamp   -> Block(75)
+ 73 Glow Panel  -> Block(76)
+ 74 Torch       -> Block(12)
+
+DetailUtility
+ 75 Red Brick          -> Block(10)
+ 76 Roof Tile          -> Block(77)
+ 77 Checker Tile       -> Block(78)
+ 78 Ceramic Tile       -> Block(79)
+ 79 Metal Panel        -> Block(80)
+ 80 Rusted Metal       -> Block(81)
+ 81 Copper             -> Block(82)
+ 82 Weathered Copper   -> Block(83)
+ 83 Gold Block         -> Block(84)
+ 84 Prismarine         -> Block(85)
+ 85 Dark Prismarine    -> Block(86)
+ 86 Ice                -> Block(87)
+ 87 Packed Ice         -> Block(88)
+ 88 Water              -> Block(5)
+
+Shapes — slabs
+ 89 Stone Slab           -> Slab{0,1}
+ 90 Stone Brick Slab     -> Slab{1,21}
+ 91 Cobblestone Slab     -> Slab{2,11}
+ 92 Slate Slab           -> Slab{3,24}
+ 93 Marble Slab          -> Slab{4,30}
+ 94 Limestone Brick Slab -> Slab{5,29}
+ 95 Sandstone Slab       -> Slab{6,32}
+ 96 Red Brick Slab       -> Slab{7,10}
+ 97 Oak Slab             -> Slab{8,8}
+ 98 Birch Slab           -> Slab{9,41}
+ 99 Spruce Slab          -> Slab{10,42}
+100 Dark Oak Slab        -> Slab{11,43}
+
+Shapes — stairs
+101 Stone Stairs           -> Stair{0}
+102 Stone Brick Stairs     -> Stair{1}
+103 Cobblestone Stairs     -> Stair{2}
+104 Slate Stairs           -> Stair{3}
+105 Marble Stairs          -> Stair{4}
+106 Limestone Brick Stairs -> Stair{5}
+107 Sandstone Stairs       -> Stair{6}
+108 Red Brick Stairs       -> Stair{7}
+109 Oak Stairs             -> Stair{8}
+110 Birch Stairs           -> Stair{9}
+111 Spruce Stairs          -> Stair{10}
+112 Dark Oak Stairs        -> Stair{11}
+
+Shapes — panes
+113 Clear Glass Pane -> Pane{0}
+114 White Glass Pane -> Pane{1}
+115 Red Glass Pane   -> Pane{2}
+116 Green Glass Pane -> Pane{3}
+117 Cyan Glass Pane  -> Pane{4}
+118 Blue Glass Pane  -> Pane{5}
+
+Shapes — fences
+119 Oak Fence      -> Fence{0}
+120 Birch Fence    -> Fence{1}
+121 Spruce Fence   -> Fence{2}
+122 Dark Oak Fence -> Fence{3}
+```
+
+기본 hotbar item ID:
+
+```rust
+pub const DEFAULT_HOTBAR_ITEMS: [ItemId; 9] = [4, 5, 14, 35, 63, 89, 101, 113, 74];
+```
+
+M6의 `world::block::HOTBAR: [BlockId; 9]`는 회귀 테스트와 save migration을 위해 삭제·개명하지 않는다. M10 runtime input/UI는 그것을 사용하지 않고 `DEFAULT_HOTBAR_ITEMS`와 settings의 `creative.hotbar`만 사용한다.
+
+`search_terms`는 임의 동의어를 넣지 않는다. 각 item에 다음 토큰만 붙인다.
+
+```text
+공통: category의 영문 표시명을 lowercase
+Block: "block"
+AxisLog: "log wood axis"
+Slab: "shape slab half"
+Stair: "shape stair steps"
+Pane: "shape pane glass"
+Fence: "shape fence wood"
+emission>0: "light glowing emissive"
+translucent: "transparent"
+```
+
+`icon_block`은 Block placement면 그 BlockId, AxisLog면 Y variant, Slab면 bottom state, Stair면 South·bottom state, Pane/Fence면 mask 15다. icon array layer는 `ItemId-1`이다.
+
+#### 20.6.4 BlockDef 확장
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderClass {
+    Opaque,
+    Cutout,
+    Translucent,
+    Water,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeKind {
+    Cube,
+    Slab { top: bool },
+    Stair { facing: Facing, upside_down: bool },
+    Pane { mask: u8 },
+    Fence { mask: u8 },
+}
+
+pub struct BlockDef {
+    pub name: &'static str,
+    pub solid: bool,
+    pub opaque: bool,             // full cube visibility semantics only
+    pub translucent: bool,
+    pub textures: [u16; 6],
+    pub emission: u8,
+    pub emission_rgb: [f32; 3],
+    pub light_blocking: bool,
+    pub render_class: RenderClass,
+    pub shape: ShapeKind,
+    pub pick_item: ItemId,
+}
+```
+
+render/light/collision 분류는 다음으로 고정한다.
+
+| 대상 | solid | render_class | light_blocking | opaque/translucent |
+|---|---|---|---|---|
+| AIR | false | 렌더 안 함 | false | false/false |
+| WATER | false | Water | false | false/true |
+| full GLASS·ICE·PACKED_ICE | true | Translucent | false | false/true |
+| glass pane | true | Translucent | false | false/true |
+| leaves 4종 | true | Cutout | false | false/false |
+| slab·stair·fence | true | Opaque | false | false/false |
+| 그 외 full cube | true | Opaque | true | true/false |
+
+`light_blocking=true`인 것은 opaque full cube뿐이다. slab, stair, pane, fence, leaves, glass, ice, water는 false다. M6 solver는 `opaque`가 아니라 `light_blocking`을 사용하도록 바꾼다. 기존 full opaque 블록의 결과는 bitwise 동일해야 한다. `MAX_BLOCK_ID = 959`이며 registry는 0..=959를 포함하고 예약 ID에는 AIR definition을 넣는다.
+
+#### 20.6.5 1/16 형상 표현
+
+모든 non-cube 형상은 16³ occupancy로 정의한다.
+
+```rust
+pub const SUBVOXEL: i32 = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ShapeMask {
+    pub bits: [u64; 64], // 4096 bits, index x + 16*(z + 16*y)
+}
+
+pub struct ShapeTemplate {
+    pub mask: ShapeMask,
+    pub quads: Vec<TemplateQuad>,
+    pub boundary: [[u16; 16]; 6], // 각 face의 16행 coverage
+    pub collision: SmallAabbList,
+}
+```
+
+새 크레이트를 추가하지 않는다. `SmallAabbList`는 `[Aabb; 12] + len` 고정 배열로 구현한다.
+
+occupancy:
+
+- Cube: x,y,z 0..16.
+- bottom slab: y 0..8.
+- top slab: y 8..16.
+- bottom stair: y 0..8 전체 + y 8..16의 high half.
+- upside-down stair: y 8..16 전체 + y 0..8의 high half.
+- North high half: z 0..8.
+- East high half: x 8..16.
+- South high half: z 8..16.
+- West high half: x 0..8.
+- pane core: x 7..9, y 0..16, z 7..9.
+- pane arm N: x 7..9, z 0..7; E: x 9..16,z 7..9; S: x 7..9,z 9..16; W: x 0..7,z 7..9.
+- fence post: x 6..10,y 0..16,z 6..10.
+- fence rail N: x 6..10,z 0..6,y 5..8 및 y 11..14. E/S/W는 회전.
+
+ShapeTemplate quads는 occupancy 16³에 3축 greedy를 한 번 실행해 만든다. 텍스처 UV는 월드 블록 단위이므로 1/16 좌표를 그대로 16으로 나눈다. 서로 다른 재질은 같은 기하 template을 공유한다.
+
+#### 20.6.6 정점 패킹의 남은 비트 사용
+
+D5와 M6 light 비트를 유지한다.
+
+```text
+a:
+  x[0..6) y[6..12) z[12..18) face[18..21) ao[21..23)
+  lowered[23] frac_x[24..28) frac_y[28..32)
+
+b:
+  tex[0..16) block_light[16..20) sky_light[20..24)
+  frac_z[24..28) reserved[28..32)
+```
+
+```text
+position = vec3(integer) + vec3(frac_x,frac_y,frac_z)/16
+position.y -= lowered ? 0.125 : 0
+```
+
+정수 좌표 32에서 frac은 반드시 0이다. pack 함수는 `integer==32 && frac!=0`을 오류로 본다. 기존 cube 정점은 frac 0이므로 M6 snapshot과 동일하다.
+
+#### 20.6.7 partial face culling
+
+full-cube greedy 셀의 이웃 face coverage가:
+
+- 0이면 기존 greedy에 포함.
+- 0xffff×16이고 occluding이면 제거.
+- 일부이면 일반 greedy에서 제외하고 `full_mask - neighbor_coverage`를 2D greedy해 subface quads를 만든다.
+
+non-cube boundary face는 `shape_coverage - neighbor_coverage`를 2D greedy한다. 내부 plane face는 그대로 출력한다.
+
+occluding 규칙:
+
+1. Opaque full/partial shape는 occupancy가 덮는 부분을 occlude.
+2. Cutout leaves는 이웃을 occlude하지 않는다.
+3. 같은 glass family끼리는 겹치는 coverage를 occlude.
+4. 같은 pane family끼리는 겹치는 coverage를 occlude.
+5. WATER-WATER는 기존처럼 내부 면 제거.
+6. fence끼리는 같은 material 여부와 관계없이 겹치는 rail/post face를 occlude.
+
+micro AO는 face 밖 1 subvoxel의 side1·side2·corner occupancy를 읽고 기존 0..3 공식을 쓴다. 이 샘플은 현재 블록과 26 이웃의 `ShapeMask`를 조회한다. `PaddedChunk`의 블록 ID로 shape mask를 찾으며 새 World lock을 만들지 않는다. partial vertex의 block/sky light는 vertex에서 face normal 방향으로 `1/32`블록 이동한 점을 기준으로 주변 네 block cell을 선택해 M6의 정수 반올림 평균 `(sum+2)/4`를 쓴다. 같은 geometric vertex를 공유하는 template quad는 동일 light 값을 가져야 한다.
+
+#### 20.6.8 충돌·레이캐스트
+
+렌더 occupancy와 충돌 AABB:
+
+- cube/slab/stair/pane는 occupancy bounding boxes와 동일.
+- fence 렌더 높이는 1.0블록, collision은 각 post/arm AABB의 max_y를 1.5블록으로 확장한다.
+- pane collision은 렌더 box와 동일.
+
+기존 player swept AABB는 대상 블록의 `collision_boxes(id)`를 순회한다. 한 tick에서 검사하는 AABB 상한은 broad-phase block 64개 × block당 12개다. 상한 초과 시 panic하지 않고 추가 empty box를 무시하지도 않는다. broad-phase 범위를 축별로 쪼개 전체를 처리한다.
+
+raycast:
+
+1. Amanatides–Woo로 block cell 순회.
+2. cell이 AIR가 아니면 해당 shape의 local AABB들을 slab ray test.
+3. `t`가 현재 cell entry 이상이고 cell exit 이하인 가장 가까운 hit를 선택.
+4. shape AABB를 모두 miss하면 DDA를 계속한다.
+5. 반환 normal은 맞은 AABB face normal, `local_hit`은 0..1 위치다.
+
+```rust
+pub struct RayHit {
+    pub block: IVec3,
+    pub normal: IVec3,
+    pub distance: f32,
+    pub local_hit: Vec3,
+    pub block_id: BlockId,
+}
+```
+
+#### 20.6.9 배치 규칙
+
+AxisLog:
+
+```text
+clicked normal ±X → x variant
+clicked normal ±Y → y variant
+clicked normal ±Z → z variant
+```
+
+Slab:
+
+- clicked cell에 같은 material bottom slab가 있고 `normal=+Y` 또는 local_hit.y>0.5이면 full block으로 merge.
+- 같은 material top slab가 있고 `normal=-Y` 또는 local_hit.y<0.5이면 full merge.
+- 새 adjacent cell:
+  - normal=-Y → top.
+  - normal=+Y → bottom.
+  - side face → local_hit.y>0.5이면 top, 아니면 bottom.
+
+Stair:
+
+```text
+camera horizontal forward의 절댓값이 큰 축을 고른다.
+high-side facing = cardinal(-camera_forward_xz)
+upside_down = normal==-Y OR (normal.y==0 AND local_hit.y>0.5)
+```
+
+Pane/Fence 연결:
+
+- 같은 family state와 연결.
+- pane는 opaque full-face cube 및 모든 pane family와 연결.
+- fence는 opaque full-face cube 및 모든 fence family와 연결.
+- slab/stair에는 연결하지 않는다.
+- 배치·파괴 뒤 edited cell과 N/E/S/W 4셀의 mask를 재계산한다.
+- 자동 state 변화도 save 대상 modified로 기록하고 콘텐츠 version을 올린다.
+- 한 사용자 edit에서 같은 청크 version은 모든 state 변화가 끝난 뒤 한 번만 증가한다.
+
+Middle mouse pick:
+
+- `pick_item`이 hotbar에 있으면 그 slot 선택.
+- 없으면 현재 선택 slot을 `pick_item`으로 교체.
+- AIR는 아무 동작 없음.
+
+M8 LOD 입력에는 다음 `lod_equivalent(id)`를 먼저 적용한다.
+
+```text
+full cube → 자기 ID
+axis log X/Z → 같은 family Y log
+slab/stair → 해당 material의 full block
+pane/fence → AIR
+예약/invalid → AIR
+```
+
+M9 level-0 clipmap에서 shape material alpha는 `occupied_subvoxels/4096`이다. DDA hit threshold 0.5를 유지하므로 slab(0.5)와 stair(0.75)는 GI occluder, pane/fence는 GI 비차폐다. level 1 이상은 `lod_equivalent` 결과를 쓴다. shape edit는 기존 네 clipmap level을 모두 invalidation한다.
+
+저장 포맷은 계속 `VFC1`의 `u16` block 배열이다. concrete state BlockId를 그대로 저장하며 version 2 chunk format을 만들지 않는다.
+
+### 20.7 절차 재질 사양
+
+#### 20.7.0 material-layer 이름과 추가 순서
+
+현재 M6 `TEXTURES`의 기존 이름·숫자 layer는 immutable prefix다. 어떤 항목도 재배치하지 않는다. 새 layer는 아래 이름을 **줄 순서대로** append한다. 이미 prefix에 같은 이름이 있으면 중복 추가하지 않고 기존 layer를 재사용한다. shape state는 새 layer를 만들지 않고 base material layer를 재사용한다.
+
+```text
+dirt_path
+gravel
+red_sand
+clay
+mud
+snow
+moss
+polished_stone
+stone_bricks
+mossy_stone_bricks
+chiseled_stone
+slate
+polished_slate
+basalt
+polished_basalt
+limestone
+limestone_bricks
+marble
+marble_tiles
+sandstone
+cut_sandstone
+red_sandstone
+quartz
+quartz_tiles
+obsidian
+birch_log_side
+birch_log_top
+spruce_log_side
+spruce_log_top
+dark_oak_log_side
+dark_oak_log_top
+birch_planks
+spruce_planks
+dark_oak_planks
+birch_leaves
+spruce_leaves
+dark_oak_leaves
+bookshelf_side
+crate_side
+crate_top
+barrel_side
+barrel_top
+hay_side
+hay_top
+white_concrete
+light_gray_concrete
+gray_concrete
+black_concrete
+brown_concrete
+red_concrete
+orange_concrete
+yellow_concrete
+lime_concrete
+green_concrete
+cyan_concrete
+light_blue_concrete
+blue_concrete
+purple_concrete
+magenta_concrete
+pink_concrete
+white_glass
+red_glass
+green_glass
+cyan_glass
+blue_glass
+glowstone
+sea_lantern
+warm_lamp
+cold_lamp
+glow_panel
+roof_tile
+checker_tile
+ceramic_tile
+metal_panel
+rusted_metal
+copper
+weathered_copper
+gold_block
+prismarine
+dark_prismarine
+ice
+packed_ice
+```
+
+face mapping:
+
+- axis log: 축에 수직인 두 face는 `<wood>_log_top`, 나머지 네 face는 `<wood>_log_side`. Oak는 기존 log top/side layer를 재사용한다.
+- BOOKSHELF: ±X/±Z `bookshelf_side`, ±Y oak planks.
+- CRATE: +Y/-Y `crate_top`, 나머지 `crate_side`.
+- BARREL: +Y/-Y `barrel_top`, 나머지 `barrel_side`.
+- HAY_BALE: +Y/-Y `hay_top`, 나머지 `hay_side`.
+- GRASS·기존 Oak log 등 prefix block은 기존 mapping 유지.
+- slab/stair는 대응 full block의 face mapping.
+- pane는 대응 full glass의 같은 layer를 여섯 face에 사용.
+- fence는 대응 plank layer를 여섯 face에 사용.
+- GLOW_PANEL은 여섯 face 모두 `glow_panel`.
+
+append 뒤 전체 layer 수는 128 이하여야 한다. `TEXTURES`, albedo/material/emission 배열, `MaterialGpu` LUT가 이 순서를 공유한다.
+
+#### 20.7.1 공통 생성기
+
+모든 texture layer는 외부 PNG가 없을 때 `TextureRecipe`로 생성한다.
+
+```rust
+pub enum TexturePattern {
+    StoneNoise,
+    Cobble,
+    Brick,
+    Tile,
+    Concrete,
+    Plank,
+    LogSide,
+    LogTop,
+    Leaves,
+    Glass,
+    MetalPanel,
+    Organic,
+    Ice,
+    EmissiveGrid,
+    Bookshelf,
+    Crate,
+    Barrel,
+    Hay,
+}
+
+pub struct TextureRecipe {
+    pub name: &'static str,
+    pub pattern: TexturePattern,
+    pub base_srgb: [u8; 3],
+    pub accent_srgb: [u8; 3],
+    pub mortar_srgb: [u8; 3],
+    pub roughness: u8,
+    pub metallic: u8,
+    pub normal_strength: f32,
+    pub height_scale: f32,
+    pub emission: u8,
+}
+```
+
+hash:
+
+```text
+v = x*0x1f123bb5 ^ y*0x05491333 ^ seed*0x9e3779b9
+v ^= v>>16; v *= 0x7feb352d; v ^= v>>15; v *= 0x846ca68b; v ^= v>>16
+noise = (v & 0xffff)/65535
+```
+
+pattern 규칙:
+
+- StoneNoise: `t=0.65+0.35*(0.6*n(x,y)+0.3*n(x/2,y/2)+0.1*n(x/4,y/4))`, height=t.
+- Cobble: 4×4 Voronoi cell, cell border 거리 <0.11이면 mortar, cell마다 hash tint ±12%, height mortar 0.15/stone 0.65~1.
+- Brick: row height 4, brick width 8, 홀수 row x offset 4, 1px mortar, height mortar 0.10/brick 0.75+noise*0.20.
+- Tile: 4×4 또는 8×4 grid를 seed bit로 선택, 1px joint, height joint 0.15/tile 0.80.
+- Concrete: base와 accent를 noise 0.35 이내로 혼합, height 0.48~0.55.
+- Plank: 4px board, 1px seam, grain `sin((x+noise*2)*1.7)`, seam height 0.12, wood 0.65~0.90.
+- LogSide: 세로 grain, 4px마다 dark line; LogTop: 중심 `(7.5,7.5)` 반경 ring `sin(r*2.4+noise)`.
+- Leaves: alpha=0 if hash<0.30, 아니면 255; height 0.4~1.0.
+- Glass: interior alpha 48, 1px border alpha 128, height 0.50, roughness recipe.
+- MetalPanel: 8×8 panel seam 1px, corner bolt at `(1,1),(6,1),(1,6),(6,6)`, metallic recipe.
+- EmissiveGrid: 1px dark frame, 안쪽 emission mask recipe.emission.
+- Ice: diagonal 1px crack 두 개, alpha 160, normal strength 0.20.
+- Bookshelf/Crate/Barrel/Hay는 이름 그대로 4px 반복 구조를 사용하고 seed로 색만 ±8% 변동.
+
+#### 20.7.2 재질 팔레트
+
+RGB는 sRGB 0..255다. `mortar`가 의미 없는 pattern은 base의 70%로 둔다.
+
+| 재질군 | pattern | base | accent | mortar | rough | metal | normal | height | emit |
+|---|---|---|---|---|---:|---:|---:|---:|---:|
+| stone | StoneNoise | 118,122,126 | 151,154,157 | 82,84,88 | 218 | 0 | 1.3 | .025 | 0 |
+| cobble | Cobble | 112,116,118 | 148,151,152 | 70,72,73 | 238 | 0 | 1.8 | .045 | 0 |
+| polished stone | Tile | 132,136,140 | 155,158,161 | 104,106,109 | 165 | 0 | .8 | .018 | 0 |
+| stone brick | Brick | 119,123,126 | 146,149,151 | 76,78,80 | 215 | 0 | 1.5 | .040 | 0 |
+| mossy stone brick | Brick | 103,119,99 | 132,142,120 | 68,74,66 | 225 | 0 | 1.6 | .040 | 0 |
+| slate | Tile | 61,69,78 | 90,98,107 | 42,46,52 | 205 | 0 | 1.2 | .025 | 0 |
+| basalt | StoneNoise | 45,47,52 | 72,74,79 | 28,29,32 | 220 | 0 | 1.5 | .032 | 0 |
+| limestone | StoneNoise | 188,178,145 | 220,208,169 | 143,134,108 | 210 | 0 | 1.0 | .025 | 0 |
+| marble | StoneNoise | 218,216,207 | 166,176,184 | 190,188,180 | 135 | 0 | .9 | .018 | 0 |
+| sandstone | StoneNoise | 201,174,112 | 229,204,143 | 158,132,83 | 224 | 0 | 1.2 | .030 | 0 |
+| red sandstone | StoneNoise | 177,91,48 | 213,124,68 | 132,63,33 | 225 | 0 | 1.2 | .030 | 0 |
+| red brick | Brick | 151,66,48 | 190,91,65 | 91,85,78 | 215 | 0 | 1.7 | .045 | 0 |
+| quartz | Tile | 221,217,205 | 244,241,231 | 178,174,165 | 135 | 0 | .8 | .016 | 0 |
+| obsidian | StoneNoise | 24,18,35 | 55,37,76 | 15,12,22 | 90 | 0 | .7 | .012 | 0 |
+| oak plank | Plank | 153,108,59 | 196,145,82 | 91,62,34 | 175 | 0 | 1.2 | .025 | 0 |
+| birch plank | Plank | 202,181,132 | 230,211,161 | 151,131,91 | 170 | 0 | 1.0 | .022 | 0 |
+| spruce plank | Plank | 105,72,44 | 141,101,62 | 63,42,26 | 185 | 0 | 1.2 | .026 | 0 |
+| dark oak plank | Plank | 67,45,31 | 98,67,43 | 39,27,19 | 190 | 0 | 1.2 | .026 | 0 |
+| concrete white | Concrete | 208,210,208 | 225,226,224 | 151,153,151 | 230 | 0 | .25 | .004 | 0 |
+| concrete light gray | Concrete | 151,155,158 | 168,172,175 | 109,112,114 | 230 | 0 | .25 | .004 | 0 |
+| concrete gray | Concrete | 91,96,101 | 111,116,121 | 64,68,72 | 230 | 0 | .25 | .004 | 0 |
+| concrete black | Concrete | 31,34,38 | 49,53,58 | 20,22,25 | 225 | 0 | .25 | .004 | 0 |
+| concrete brown | Concrete | 112,69,46 | 139,88,58 | 79,47,32 | 230 | 0 | .25 | .004 | 0 |
+| concrete red | Concrete | 172,48,45 | 204,67,60 | 120,32,30 | 230 | 0 | .25 | .004 | 0 |
+| concrete orange | Concrete | 216,112,36 | 239,137,53 | 157,78,23 | 230 | 0 | .25 | .004 | 0 |
+| concrete yellow | Concrete | 229,190,47 | 246,214,72 | 166,136,29 | 230 | 0 | .25 | .004 | 0 |
+| concrete lime | Concrete | 121,183,47 | 147,210,69 | 84,128,30 | 230 | 0 | .25 | .004 | 0 |
+| concrete green | Concrete | 48,126,57 | 66,153,75 | 31,88,38 | 230 | 0 | .25 | .004 | 0 |
+| concrete cyan | Concrete | 38,146,159 | 57,174,187 | 25,102,112 | 230 | 0 | .25 | .004 | 0 |
+| concrete light blue | Concrete | 77,151,209 | 105,177,231 | 52,105,148 | 230 | 0 | .25 | .004 | 0 |
+| concrete blue | Concrete | 51,76,174 | 69,99,205 | 34,50,122 | 230 | 0 | .25 | .004 | 0 |
+| concrete purple | Concrete | 111,61,171 | 137,80,201 | 76,40,120 | 230 | 0 | .25 | .004 | 0 |
+| concrete magenta | Concrete | 181,62,166 | 208,83,193 | 128,40,117 | 230 | 0 | .25 | .004 | 0 |
+| concrete pink | Concrete | 226,126,159 | 244,153,184 | 171,88,116 | 230 | 0 | .25 | .004 | 0 |
+| clear glass | Glass | 190,224,232 | 226,246,250 | 133,176,187 | 20 | 0 | .25 | .002 | 0 |
+| white glass | Glass | 225,228,226 | 248,250,249 | 173,178,176 | 26 | 0 | .25 | .002 | 0 |
+| red glass | Glass | 204,74,65 | 239,113,102 | 147,45,40 | 28 | 0 | .25 | .002 | 0 |
+| green glass | Glass | 71,179,91 | 106,215,125 | 43,125,60 | 28 | 0 | .25 | .002 | 0 |
+| cyan glass | Glass | 55,187,205 | 91,223,238 | 34,131,145 | 25 | 0 | .25 | .002 | 0 |
+| blue glass | Glass | 69,111,211 | 103,146,239 | 43,73,153 | 25 | 0 | .25 | .002 | 0 |
+| metal panel | MetalPanel | 113,121,128 | 159,166,171 | 70,75,80 | 92 | 230 | 1.0 | .020 | 0 |
+| rusted metal | MetalPanel | 132,74,42 | 174,105,59 | 76,47,31 | 172 | 191 | 1.3 | .030 | 0 |
+| copper | MetalPanel | 183,105,61 | 222,142,86 | 110,61,37 | 104 | 230 | .9 | .018 | 0 |
+| weathered copper | MetalPanel | 70,139,120 | 104,174,151 | 43,91,79 | 150 | 230 | 1.0 | .020 | 0 |
+| gold | MetalPanel | 224,170,42 | 249,210,80 | 156,111,25 | 82 | 255 | .7 | .015 | 0 |
+| glowstone | Organic | 213,151,62 | 255,211,111 | 116,74,33 | 145 | 0 | 1.2 | .025 | 220 |
+| sea lantern | Tile | 154,220,211 | 222,255,244 | 81,139,136 | 90 | 0 | .8 | .015 | 235 |
+| warm lamp | EmissiveGrid | 235,160,72 | 255,219,135 | 67,47,31 | 80 | 0 | .7 | .012 | 255 |
+| cold lamp | EmissiveGrid | 155,210,247 | 222,244,255 | 43,59,72 | 75 | 0 | .7 | .012 | 255 |
+| glow panel | EmissiveGrid | 207,217,219 | 255,255,255 | 58,62,65 | 70 | 0 | .5 | .008 | 245 |
+| ice | Ice | 142,205,232 | 206,238,250 | 89,155,188 | 35 | 0 | .3 | .006 | 0 |
+
+표에 없는 세부 블록은 가장 가까운 재질군을 사용한다. 정확한 매핑:
+
+- DIRT, DIRT_PATH, MUD, CLAY, GRAVEL, SAND, RED_SAND, SNOW, MOSS는 `Organic` 또는 `StoneNoise`에 이름별 base color만 적용한다.
+- 각 log의 side/top은 같은 wood palette의 `LogSide`/`LogTop`.
+- leaves는 wood별 base `(72,132,61)`, `(112,156,73)`, `(55,103,50)`, `(48,84,44)`.
+- BOOKSHELF, CRATE, BARREL, HAY_BALE는 해당 전용 pattern과 oak/hay palette.
+- ROOF_TILE `(124,49,39)/(171,69,52)`, CHECKER_TILE `(218,216,207)/(49,53,59)`, CERAMIC_TILE `(184,204,207)/(225,237,238)`.
+- PRISMARINE `(73,155,145)/(111,190,177)`, DARK_PRISMARINE `(42,73,68)/(59,101,93)`.
+- PACKED_ICE는 ice base를 15% 밝게 하고 alpha 220.
+
+### 20.8 I 인벤토리·HUD·아이콘
+
+#### 20.8.1 상태와 입력
+
+```rust
+pub struct CreativeInventory {
+    pub open: bool,
+    pub category: Option<ItemCategory>, // None=All
+    pub query: String,                  // ASCII lowercase, max 32 bytes
+    pub scroll_row: u16,
+    pub hovered: Option<ItemId>,
+    pub hotbar: [ItemId; 9],
+    pub selected_slot: u8,
+}
+```
+
+입력:
+
+- `I`: inventory 열기/닫기.
+- inventory open 중 `Escape`: inventory 닫기. pause menu를 열지 않는다.
+- inventory closed 중 `Escape`: pause menu.
+- inventory open 동안 cursor unlock·visible, player physics·world time 정지, streaming 결과 apply·save·shader reload는 계속.
+- inventory closed에서 숫자 1..9는 slot 선택, mouse wheel은 slot을 mod 9로 순환한다. 둘 다 ItemId가 실제로 바뀌면 Switch action을 시작한다.
+- `Q` drop과 world item entity는 구현하지 않는다.
+- 글자 입력은 winit text event의 ASCII 32..126만 받아 lowercase로 저장. 한글 IME는 M10 범위가 아니다.
+- `Backspace`: query 마지막 Unicode scalar 제거. 실제 입력이 ASCII라 1바이트다.
+- `Ctrl+F`: search field focus.
+- mouse wheel 한 notch: 3행 이동.
+- item left click: 현재 selected hotbar slot에 배치, inventory 유지.
+- hovered item 위 숫자 1..9: 해당 hotbar slot에 배치.
+- search field focus 중 숫자 키는 pointer가 item 위에 있을 때 hotbar 배치가 우선하고, item 위가 아니면 query에 입력한다.
+- hotbar slot left click: selected slot 변경.
+- empty grid click: 동작 없음.
+- tooltip: hover 0.35초 뒤 item English name.
+
+검색은 `name + search_terms`에 대한 ASCII lowercase substring이다. category filter 뒤 검색한다. 결과 순서는 ItemId 오름차순이다.
+
+#### 20.8.2 레이아웃
+
+기준 canvas 1280×720. 실제 출력에는
+
+```text
+ui_scale = clamp(settings.ui.scale,0.75,1.50)
+S = max(1, round(output_h/720 * ui_scale))
+```
+
+을 곱한다. design 좌표의 실제 위치는 `offset_x=(output_w/S-1280)/2`, `offset_y=(output_h/S-720)/2`를 더한 뒤 S를 곱하고 physical pixel로 round한다. offset이 음수이면 0으로 clamp하고 panel에는 clip rect를 적용한다.
+
+Inventory panel:
+
+```text
+panel x=174, y=66, w=932, h=588
+background rgba=(18,22,30,235)
+border outer #0b0d12 2px, inner #5f6878 1px
+```
+
+- title `(202,88)`: `BUILD INVENTORY`.
+- search `(568,82,w=502,h=34)`.
+- category column `(198,132,w=148)`.
+- category button `148×42`, gap 6, 순서 All/Terrain/Masonry/Wood/Color/Glass & Light/Detail/Shapes.
+- grid origin `(374,132)`.
+- 9 columns ×6 rows.
+- cell 66×66, gap 6.
+- visible item 54개.
+- scroll bar x=1029,y=132,w=12,h=426.
+- hotbar preview y=584.
+
+HUD hotbar는 inventory closed/open 모두 보인다.
+
+```text
+slot outer size = 44*S
+slot gap = 4*S
+bottom margin = 18*S
+selected border = 3*S, rgba(245,245,245,255)
+normal border = 1*S, rgba(105,112,125,255)
+background = rgba(12,14,19,205)
+```
+
+crosshair는 중앙 9×9 design pixel, 가운데 1px hole, white core와 black 1px outline다.
+
+inventory/pause open 시 world LDR를 quarter-resolution으로 downsample하고 9-tap separable Gaussian blur sigma 2.0을 적용한 뒤 black alpha 0.35를 덮는다. blur GPU p95 ≤0.25ms.
+
+#### 20.8.3 item icon bake
+
+시작 시 122개 item icon을 64×64×122 `Rgba8UnormSrgb` array에 굽는다.
+
+1. item별 대표 BlockId/ShapeTemplate mesh.
+2. 128×128 `Rgba16Float` 임시 target, `Depth32Float`.
+3. orthographic camera yaw -45°, pitch 30°, scale 1.25.
+4. key light normalize `(-0.4,-1,-0.3)`, intensity 2.5.
+5. fill `(0.22,0.27,0.34)`.
+6. alpha 0 clear.
+7. 2×2 box downsample render pass로 64×64 array layer에 기록.
+8. 모든 122 layer가 끝난 뒤 임시 target 제거.
+
+icon은 world time, day/night, GI 영향을 받지 않는다. emissive block은 exposure 1.0 ACES 후 core가 255를 넘지 않는다.
+
+icon bake wall time Apple M5 release ≤500ms, array memory 약 2MiB다.
+
+### 20.9 1인칭 손·held item
+
+#### 20.9.1 렌더 위치
+
+viewmodel은 native LDR world 결과 뒤, UI 앞에 그린다. TAAU history·depth와 분리한다.
+
+- target: native `Rgba8UnormSrgb` LDR.
+- depth: native `Depth32Float`, 매 프레임 1.0 clear.
+- viewmodel FOV 68°.
+- near 0.01, far 10.
+- depth write on, compare Less.
+- cull Back.
+- world depth와 비교하지 않는다.
+- viewmodel shader 내부에서 linear PBR → exposure 1.0 → 같은 ACES·color grade를 적용한다.
+
+#### 20.9.2 손 모델
+
+오른팔 하나를 6면 cuboid로 만든다.
+
+```text
+size = (0.26,0.72,0.26)
+arm pivot = top center
+base translation camera space = (0.58,-0.52,-0.88)
+base rotation degrees = (-22,-28,-8)
+```
+
+기본 texture 경로 `assets/textures/player/hand.png`, 16×16 RGBA. 없으면 절차 생성:
+
+- skin base `(196,139,101)`.
+- light `(224,169,126)`.
+- shadow `(145,91,65)`.
+- sleeve는 아래 42%를 `(54,78,122)`.
+- 1px noise ±6, alpha 255.
+
+held item:
+
+```text
+base translation = (0.38,-0.34,-0.66)
+base rotation degrees = (18,-38,8)
+scale cube/full item = 0.34
+scale slab/stair = 0.38
+scale pane/fence = 0.46
+```
+
+item mesh는 world ShapeTemplate를 재사용하되 별도 f32 `ViewVertex`로 변환해 작은 buffer cache에 저장한다. 122개 전체 GPU cache 상한 4MiB.
+
+viewmodel lighting:
+
+```text
+sky_curve = LIGHT_LEVEL[player_head_sky] * sun_factor
+block_curve = LIGHT_LEVEL[player_head_block]
+ambient = sky_color*(0.18+0.32*sky_curve)
+        + vec3(1.0,0.58,0.28)*(0.08+0.28*block_curve)
+direct = GGX(N,V,-sun_dir) * sun_color * 1.6 * sky_curve
+color = material*ambient + direct + emission
+```
+
+viewmodel은 CSM을 샘플하지 않는다. 손이 갑자기 검게 되는 것을 막기 위해 최종 ambient 각 채널은 최소 0.06이다. inventory 또는 pause menu가 open이면 viewmodel draw를 완전히 생략한다.
+
+#### 20.9.3 애니메이션
+
+```rust
+pub enum HandAction {
+    Idle,
+    Break { elapsed: f32 },
+    Place { elapsed: f32 },
+    Switch { elapsed: f32, from: ItemId, to: ItemId },
+}
+```
+
+idle:
+
+```text
+translation += (sin(t*0.8)*0.008, sin(t*1.6)*0.006,0)
+rotation.z += sin(t*0.8)*0.8°
+```
+
+walk phase는 지면 수평 누적 거리다.
+
+```text
+phase += horizontal_distance * π/0.90
+translation.x += sin(phase)*0.025
+translation.y += abs(cos(phase))*0.018
+rotation.z += sin(phase)*2.5°
+```
+
+sprint 계수 1.35. 공중·비행·inventory/pause 중 walk bob은 0.15초 half-life로 0에 감쇠한다.
+
+Break duration 0.26초:
+
+```text
+p=clamp(elapsed/.26,0,1)
+s=sin(π*p)
+translation += (-0.10*s,-0.05*s,0.06*s)
+rotation += (-72*s, 18*s, 24*s) degrees
+```
+
+Place duration 0.18초:
+
+```text
+p=elapsed/.18
+s=sin(π*p)
+translation += (0,-0.03*s,-0.16*s)
+rotation += (18*s,0,-8*s)
+```
+
+Switch duration 0.20초:
+
+```text
+p=elapsed/.20
+y_offset = -0.48 * (1-(2p-1)^2) for p<0.5/after item swap
+item changes at p=0.5
+```
+
+새 action 우선순위: Place > Break > Switch > Idle. 같은 프레임에 place와 break가 발생할 수 없도록 input dispatcher가 보장한다. animation time은 `GameClock`이 아니라 pause에 영향받는 `interaction_time`; pause/inventory 중 고정한다. Break는 실제 block 제거 성공 때만, Place는 collision/규칙 검사를 통과한 실제 설치 성공 때만 시작한다. Switch는 selected ItemId가 달라질 때만 시작한다. 실패한 edit는 손 action과 sound를 만들지 않는다.
+
+hold repeat:
+
+```text
+LMB: press frame 즉시 1회, 0.22초 뒤부터 0.10초 간격
+RMB: press frame 즉시 1회, 0.25초 뒤부터 0.12초 간격
+한 frame 최대 world edit 1회
+LMB/RMB 동시 hold면 RMB Place 우선
+```
+
+반복 성공마다 Break/Place animation elapsed를 0으로 다시 시작한다.
+
+### 20.10 설정·사운드·셰이더팩·번들 보강
+
+#### 20.10.1 settings version 2
+
+키·마우스 binding은 하나의 enum으로 저장한다.
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputBinding {
+    Key(winit::keyboard::KeyCode),
+    Mouse(winit::event::MouseButton),
+}
+```
+
+`Serialize`/`Deserialize`는 derive하지 않고 문자열로 수동 구현한다. JSON 문자열 `KeyI`, `KeyW`, `Space`, `F2`, `MouseMiddle`를 명시적으로 parse/serialize한다. 알 수 없는 문자열은 해당 action의 기본 binding으로 되돌리고 warning한다. `pause=Escape`는 재바인딩할 수 없다.
+
+기존 §19 schema를 다음으로 교체한다.
+
+```json
+{
+  "version": 2,
+  "video": {
+    "preset": "m5_air_high",
+    "render_scale": 0.72,
+    "view_radius": 10,
+    "taa": true,
+    "sharpen": 0.18,
+    "shadow_resolution": 2048,
+    "shadow_distance": 224.0,
+    "pom_steps": 8,
+    "ssr_steps": 40,
+    "volumetric_steps": 32,
+    "cloud_view_steps": 40,
+    "cloud_light_steps": 6,
+    "gi_enabled": true,
+    "gi_rays": 4,
+    "gi_distance": 48.0,
+    "vsync": true,
+    "shader_pack": "builtin"
+  },
+  "controls": {
+    "mouse_sensitivity": 0.002,
+    "invert_y": false,
+    "bindings": {
+      "inventory": "KeyI",
+      "forward": "KeyW",
+      "backward": "KeyS",
+      "left": "KeyA",
+      "right": "KeyD",
+      "jump": "Space",
+      "sprint": "ControlLeft",
+      "descend": "ShiftLeft",
+      "toggle_fly": "KeyF",
+      "pause": "Escape",
+      "screenshot": "F2",
+      "debug_view": "F4",
+      "shader_reload": "KeyR",
+      "pick_block": "MouseMiddle"
+    }
+  },
+  "audio": { "master": 0.8, "effects": 0.8 },
+  "ui": { "scale": 1.0 },
+  "creative": {
+    "hotbar": [4,5,14,35,63,89,101,113,74],
+    "selected_slot": 0
+  }
+}
+```
+
+version 1 설정이 있으면 필드별 migrate하고 hotbar 기본값을 넣어 version 2로 atomic 저장한다. unsupported version은 기존 보존 규칙을 쓴다.
+
+#### 20.10.2 사운드 추가
+
+§19 절차 PCM을 유지하고 다음만 추가한다.
+
+- inventory open/close: 55ms, 640→420Hz sine chirp, amplitude 0.08.
+- hotbar switch: 35ms, 880Hz sine, amplitude 0.05.
+- pane/fence place는 place PCM high-pass 계수 0.35.
+- slab/stair place는 base place PCM.
+- viewmodel action과 sound event는 같은 interaction event ID를 공유해 중복 재생을 막는다.
+
+#### 20.10.3 셰이더팩 contract version 2
+
+팩 경로에 다음을 허용한다.
+
+```text
+textures/blocks/<name>.png                 16×16 RGBA sRGB
+textures/materials/<name>_material.png     16×16 RGBA linear
+textures/emission/<name>_emission.png      16×16 grayscale
+textures/player/hand.png                   16×16 RGBA sRGB
+```
+
+`pack.json.contract_version`은 2다. contract 1은 명확한 오류로 거부하고 builtin을 유지한다. shaderpack은 item/block registry와 shape geometry를 바꿀 수 없다.
+
+#### 20.10.4 번들
+
+§19 `.app` 구조를 유지한다. launcher는 `VF_ASSETS`, `VF_SAVE_ROOT`, `VF_SETTINGS`, `VF_SHADERPACKS`, `VF_SCREENSHOTS`를 설정한다. default save root 프로젝트 경로 계약은 개발 실행에서 유지되고, 앱 launcher 실행 때만 환경변수 우선순위로 Application Support를 쓴다.
+
+### 20.11 테스트 계약
+
+다음 이름을 그대로 추가한다.
+
+```text
+m5_air_high_internal_size_is_1848x1040
+material_arrays_share_layer_order_and_mips
+cutout_mips_preserve_coverage
+pom_reference_intersection_matches_shader_contract
+ggx_reference_is_finite_and_energy_bounded
+motion_vectors_exclude_jitter
+taau_rejects_disocclusion
+taau_history_clamps_in_ycocg
+taau_static_sequence_reduces_high_frequency_error
+csm_update_cadence_matches_contract
+gtao_flat_plane_is_unoccluded
+gtao_corner_is_occluded
+atmosphere_luts_are_finite
+
+block_registry_ids_are_stable
+item_catalog_has_exactly_122_unique_items
+every_item_has_valid_icon_and_placement
+shape_mask_counts_match_contract
+shape_template_quads_cover_mask_surface
+vertex_fraction_pack_roundtrip
+cube_vertices_keep_zero_fraction
+partial_neighbor_subtracts_only_covered_face_area
+micro_ao_reads_shape_occupancy
+stair_collision_matches_orientation
+fence_collision_height_is_one_point_five
+raycast_passes_through_empty_pane_region
+raycast_hits_stair_step
+axis_log_uses_clicked_axis
+slab_pair_merges_to_full_block
+stair_facing_is_opposite_camera_forward
+pane_connections_update_five_cells
+fence_connections_update_five_cells
+connection_update_increments_chunk_version_once
+pick_block_selects_existing_hotbar_slot
+pick_block_replaces_selected_slot_when_absent
+
+inventory_key_toggles_modal_state
+inventory_escape_closes_before_pause
+inventory_filter_order_is_stable
+inventory_scroll_clamps
+inventory_click_assigns_selected_hotbar_slot
+inventory_number_assigns_requested_slot
+settings_v1_migrates_to_v2
+creative_hotbar_roundtrips
+item_icon_bake_has_122_layers
+item_icon_alpha_background_is_clear
+hotbar_is_centered_at_1280x720
+inventory_panel_matches_contract_bounds
+viewmodel_action_priority_is_stable
+viewmodel_break_duration_is_point_two_six
+viewmodel_place_duration_is_point_one_eight
+viewmodel_pauses_with_inventory
+shaderpack_contract_one_is_rejected
+shaderpack_contract_two_is_transactional
+```
+
+판정:
+
+- 122개 ItemId가 1..122를 빈틈 없이 한 번씩 사용.
+- 모든 item placement가 유효 BlockId 또는 상태 범위를 생성.
+- bottom slab occupancy 2048, pane mask 0 occupancy 64, fence mask 0 occupancy 256.
+- ShapeTemplate 표면 microface 집합과 occupancy의 exposed microface 집합이 bitwise 동일.
+- partial cube face의 출력 면적 + neighbor coverage 면적 =256 subpixels.
+- raycast pane 빈 영역은 다음 cell hit를 반환.
+- connection edit 하나당 관련 각 chunk version 증가는 최대 1.
+- icon layer alpha 0 픽셀 비율 30~80%, icon nontransparent bbox는 20×20 이상 60×60 이하.
+- viewmodel animation transform은 pause 1초 전후 bitwise 동일.
+
+### 20.12 스냅샷 검증
+
+#### 20.12.1 M7 quality
+
+```bash
+cargo run --release --bin snapshot -- \
+  --fixture m7-materials --size 1280x720 --render-scale 1.0 \
+  --preset m5_air_high --fixed-exposure 1.0 --warmup 16 \
+  --view final --out /tmp/vf_m7_materials.png
+
+cargo run --release --bin snapshot -- \
+  --fixture m7-taau --size 1280x720 --render-scale 0.72 \
+  --preset m5_air_high --fixed-exposure 1.0 --warmup 1 \
+  --out /tmp/vf_m7_taau_1.png
+cargo run --release --bin snapshot -- \
+  --fixture m7-taau --size 1280x720 --render-scale 0.72 \
+  --preset m5_air_high --fixed-exposure 1.0 --warmup 32 \
+  --out /tmp/vf_m7_taau_32.png
+```
+
+`m7-materials` fixture는 stone, brick, wood, metal, gold, emissive의 정면 패널을 둔다. 각 패널 80×120 crop에서:
+
+- metal/gold의 specular highlight max 선형 밝기는 stone의 1.25배 이상.
+- rough stone highlight 면적은 polished stone의 1.50배 이상.
+- emissive night crop은 emission off reference의 2.0배 이상.
+- 모든 픽셀 finite, 검정 NaN 대체색 `(255,0,255)` 0개.
+
+TAAU warmup32의 high-frequency residual은 warmup1의 70% 이하, 정적 edge의 10~90% rise width는 3.0 native pixel 이하.
+
+#### 20.12.2 shape gallery
+
+```bash
+cargo run --release --bin snapshot -- \
+  --fixture m10-shapes --size 1280x720 --render-scale 1.0 \
+  --preset m5_air_high --fixed-exposure 1.0 --warmup 16 \
+  --view final --out /tmp/vf_m10_shapes.png
+
+cargo run --release --bin snapshot -- \
+  --fixture m10-shapes --size 1280x720 --view normal \
+  --out /tmp/vf_m10_shapes_normal.png
+```
+
+fixture는 bottom/top slab, 네 facing stair, pane mask 0/5/15, fence mask 0/5/15, X/Y/Z log를 고정 위치에 둔다. 프로브 계약은 fixture 코드의 `SnapshotProbe` JSON을 `/tmp/vf_m10_shapes.probes.json`에 함께 쓴다. 각 probe에는 `name`, `x`, `y`, `expected_linear_rgb`, `epsilon`이 있다. snapshot 바이너리가 PNG 저장 뒤 probe를 자체 검사하고 하나라도 실패하면 exit 1이다. 외부 사람 판정은 없다.
+
+#### 20.12.3 inventory
+
+```bash
+cargo run --release --bin snapshot -- \
+  --fixture m10-inventory --size 1280x720 --ui inventory \
+  --inventory-category all --inventory-query "" \
+  --out /tmp/vf_m10_inventory.png
+
+cargo run --release --bin snapshot -- \
+  --fixture m10-inventory --size 1280x720 --ui inventory \
+  --inventory-category shapes --inventory-query "stair" \
+  --out /tmp/vf_m10_inventory_stair.png
+```
+
+픽셀 판정:
+
+```bash
+python3 - <<'PY'
+from PIL import Image
+all_im=Image.open('/tmp/vf_m10_inventory.png').convert('RGBA')
+stair=Image.open('/tmp/vf_m10_inventory_stair.png').convert('RGBA')
+assert all_im.size==(1280,720)
+# panel corner and center opacity
+assert all_im.getpixel((174,66))[3] >= 220
+assert all_im.getpixel((640,360))[3] >= 220
+# grid region must contain many non-background icon colors
+region=all_im.crop((374,132,1026,558)).convert('RGB')
+unique=len(set(region.getdata()))
+assert unique >= 512, unique
+# filtered result shows 12 stair icons: count occupied cells by variance
+cells=0
+for row in range(6):
+  for col in range(9):
+    x=374+col*72; y=132+row*72
+    c=stair.crop((x,y,x+66,y+66)).convert('RGB')
+    vals=list(c.getdata())
+    lo=min(sum(p) for p in vals); hi=max(sum(p) for p in vals)
+    if hi-lo>80: cells+=1
+assert cells==12, cells
+PY
+```
+
+#### 20.12.4 hand
+
+```bash
+cargo run --release --bin snapshot -- \
+  --fixture m10-viewmodel --size 1280x720 --hand-action idle \
+  --held-item 101 --world-time 0.0 --out /tmp/vf_hand_idle.png
+cargo run --release --bin snapshot -- \
+  --fixture m10-viewmodel --size 1280x720 --hand-action break:0.13 \
+  --held-item 101 --world-time 0.0 --out /tmp/vf_hand_break.png
+cargo run --release --bin snapshot -- \
+  --fixture m10-viewmodel --size 1280x720 --hand-action place:0.09 \
+  --held-item 101 --world-time 0.0 --out /tmp/vf_hand_place.png
+```
+
+오른쪽 아래 crop `(700,310,1280,720)`에서 idle 대비 break/place 변경 픽셀 비율은 각각 2~30%, 왼쪽 위 crop `(0,0,500,300)` 변경 비율은 0.1% 이하다.
+
+### 20.13 최종 성능 예산
+
+Apple M5, 2560×1440, `m5_air_high`, R=10, 600 warmup + 3000 측정 frame:
+
+| 항목 | p95 예산 |
+|---|---:|
+| M7 기반 렌더 | 8.10ms |
+| M8 water/volumetric/cloud/LOD | 3.70ms |
+| M9 GI | 3.20ms |
+| viewmodel | 0.15ms |
+| HUD | 0.18ms |
+| inventory blur+UI(open) | 0.45ms |
+| 최종 GPU, HUD 상태 | ≤15.40ms |
+| 최종 GPU, inventory open | ≤15.75ms |
+| CPU update+stream+draw encode | ≤4.0ms |
+| 전체 frame p95 | ≤16.6ms |
+| 전체 frame max | <25ms |
+| 정착 | <5.0초 |
+| 총 렌더·월드 추정 메모리 | <1.35GiB |
+
+패스 timing JSON은 최소 다음 키를 가진다.
+
+```text
+shadow, gbuffer, depth_pyramid, gtao, atmosphere, deferred,
+gi_trace, gi_temporal, gi_denoise, volumetric, clouds, cloud_shadow,
+glass, water, bloom, exposure, taau_tonemap, viewmodel, ui, present,
+total_gpu
+```
+
+budget 초과 시 기능을 제거하거나 preset 수치를 바꾸지 않는다. 다음 순서로 원인을 제거한다.
+
+1. 잘못된 full-resolution intermediate.
+2. 매 프레임 texture/pipeline/bind-group 생성.
+3. 중복 Globals·chunk uniform.
+4. 불필요한 LUT/cascade/cloud-shadow 갱신.
+5. readback 대기·map blocking.
+6. draw item 정렬·allocation.
+7. shader texture sample 중복.
+8. compute workgroup occupancy와 bounds branch.
+
+### 20.14 M7~M10 분기 선결정 — 묻지 말고 이렇게
+
+- 실행 흐름 → M7→M8→M9→M10 연속. 중간 사람 리뷰 대기 없음.
+- M7 TAA → 선택이 아니라 TAAU 필수.
+- 기본 대상 품질 → `m5_air_high`, 0.72 scale, 2560×1440 60fps.
+- PBR → normal/roughness/height/emission texture arrays + GGX.
+- SSAO → GTAO.
+- high-quality 최적화 → temporal·cadence·quarter/half resolution. 품질 수치 임의 하향 금지.
+- building catalog → 정확히 122 item.
+- block storage → 계속 `u16`, 새 state도 concrete BlockId.
+- sub-block precision → 정점 spare bits의 1/16 frac.
+- shape → axis-aligned occupancy 16³; 임의 mesh 없음.
+- shapes → axis log, slab, stair, pane, fence만.
+- inventory → `I`, 9×6 grid, 검색·카테고리·scroll·hotbar assignment.
+- inventory open → gameplay/world time pause, streaming apply/save/reload 계속.
+- hand → 오른손 1개 + held item, native LDR, TAA history 제외.
+- item quantities/crafting → 없음.
+- settings → version 2, hotbar 포함.
+- shaderpack → contract 2, item/shape registry 변경 불가.
+- 중간 commit → Sol은 하지 않음. LOG에 의도한 메시지만 기록.
+- 최종 정지 → M10 검증·LOG 완료 뒤 한 번만 `M7~M10 완료, 최종 리뷰 요청`.

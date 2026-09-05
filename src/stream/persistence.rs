@@ -15,6 +15,12 @@ impl Streamer {
         streamer
     }
 
+    pub fn new_with_save_and_radius(save_dir: SaveDir, view_radius: u32) -> Self {
+        let mut streamer = Self::new_with_radius(view_radius);
+        streamer.save_dir = Some(save_dir);
+        streamer
+    }
+
     pub fn save_dir(&self) -> Option<&SaveDir> {
         self.save_dir.as_ref()
     }

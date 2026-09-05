@@ -6,6 +6,7 @@ use crate::world::{
     coords::{FACE_NORMALS, face_corners},
 };
 
+use super::shaped;
 use super::vertex::{ChunkVertex, pack, with_lowered};
 
 pub struct ChunkMesh {
@@ -16,6 +17,14 @@ pub struct ChunkMesh {
 pub struct ChunkMeshes {
     pub opaque: ChunkMesh,
     pub translucent: ChunkMesh,
+    pub water: ChunkMesh,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeshPass {
+    Opaque,
+    Translucent,
+    Water,
 }
 
 const FACE_TANGENTS: [(IVec3, IVec3); 6] = [
@@ -29,17 +38,18 @@ const FACE_TANGENTS: [(IVec3, IVec3); 6] = [
 
 /// Build a face-culled mesh for one 32³ chunk and its one-block padding.
 pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
-    mesh_chunk_pass(padded, false)
+    mesh_chunk_pass(padded, MeshPass::Opaque)
 }
 
 pub fn mesh_chunk_all(padded: &PaddedChunk) -> ChunkMeshes {
     ChunkMeshes {
-        opaque: mesh_chunk_pass(padded, false),
-        translucent: mesh_chunk_pass(padded, true),
+        opaque: mesh_chunk_pass(padded, MeshPass::Opaque),
+        translucent: mesh_chunk_pass(padded, MeshPass::Translucent),
+        water: mesh_chunk_pass(padded, MeshPass::Water),
     }
 }
 
-fn mesh_chunk_pass(padded: &PaddedChunk, translucent_pass: bool) -> ChunkMesh {
+fn mesh_chunk_pass(padded: &PaddedChunk, pass: MeshPass) -> ChunkMesh {
     let mut mesh = ChunkMesh {
         vertices: Vec::new(),
         indices: Vec::new(),
@@ -51,7 +61,18 @@ fn mesh_chunk_pass(padded: &PaddedChunk, translucent_pass: bool) -> ChunkMesh {
                 let bp = IVec3::new(x, y, z);
                 let id = padded.get(x, y, z);
                 let block = def(id);
-                if id == AIR || block.name == "air" || block.translucent != translucent_pass {
+                let selected = match pass {
+                    MeshPass::Opaque => !block.translucent,
+                    MeshPass::Translucent => block.translucent && id != crate::world::block::WATER,
+                    MeshPass::Water => id == crate::world::block::WATER,
+                };
+                if id == AIR || block.name == "air" || !selected {
+                    continue;
+                }
+
+                if let Some(kind) = shaped::shape_kind(id) {
+                    let template = crate::world::shape::shape_template(kind);
+                    shaped::append_shaped(&mut mesh, padded, bp, id, &template);
                     continue;
                 }
 
@@ -291,7 +312,8 @@ mod tests {
         padded.set(4, 0, 0, GLASS);
         let meshes = mesh_chunk_all(&padded);
         assert_eq!(meshes.opaque.vertices.len(), 24);
-        assert_eq!(meshes.translucent.vertices.len(), 48);
+        assert_eq!(meshes.translucent.vertices.len(), 24);
+        assert_eq!(meshes.water.vertices.len(), 24);
     }
 
     #[test]
@@ -300,15 +322,15 @@ mod tests {
         padded.set(0, 0, 0, WATER);
         padded.set(1, 0, 0, WATER);
         let meshes = mesh_chunk_all(&padded);
-        assert_eq!(meshes.translucent.vertices.len(), 40);
-        assert_eq!(meshes.translucent.indices.len(), 60);
+        assert_eq!(meshes.water.vertices.len(), 40);
+        assert_eq!(meshes.water.indices.len(), 60);
     }
 
     #[test]
     fn water_top_face_sets_lowered_flag() {
         let mut padded = PaddedChunk::new();
         padded.set(0, 0, 0, WATER);
-        let mesh = mesh_chunk_all(&padded).translucent;
+        let mesh = mesh_chunk_all(&padded).water;
         let patterns: Vec<Vec<bool>> = mesh
             .vertices
             .chunks_exact(4)

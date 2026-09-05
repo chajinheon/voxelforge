@@ -3,7 +3,7 @@ use winit::keyboard::KeyCode;
 
 use super::camera::Camera;
 use super::physics::MoveInput;
-const MOUSE_SENSITIVITY: f32 = 0.002;
+const DEFAULT_MOUSE_SENSITIVITY: f32 = 0.002;
 const MAX_PITCH: f32 = 89.0_f32.to_radians();
 
 /// State of the keyboard and mouse input used to fly the camera.
@@ -18,11 +18,23 @@ pub struct Controller {
     sprint: bool,
     mouse_dx: f64,
     mouse_dy: f64,
+    mouse_sensitivity: f32,
+    invert_y: bool,
 }
 
 impl Controller {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            mouse_sensitivity: DEFAULT_MOUSE_SENSITIVITY,
+            ..Self::default()
+        }
+    }
+
+    pub fn configure_look(&mut self, sensitivity: f32, invert_y: bool) {
+        if sensitivity.is_finite() && sensitivity > 0.0 {
+            self.mouse_sensitivity = sensitivity;
+        }
+        self.invert_y = invert_y;
     }
 
     /// Sets the pressed state of a movement key.
@@ -47,8 +59,9 @@ impl Controller {
 
     /// Applies pending look input and returns a world-space movement wish.
     pub fn update(&mut self, camera: &mut Camera) -> MoveInput {
-        camera.yaw += self.mouse_dx as f32 * MOUSE_SENSITIVITY;
-        camera.pitch -= self.mouse_dy as f32 * MOUSE_SENSITIVITY;
+        camera.yaw += self.mouse_dx as f32 * self.mouse_sensitivity;
+        let pitch_sign = if self.invert_y { 1.0 } else { -1.0 };
+        camera.pitch += self.mouse_dy as f32 * self.mouse_sensitivity * pitch_sign;
         camera.pitch = camera.pitch.clamp(-MAX_PITCH, MAX_PITCH);
         self.mouse_dx = 0.0;
         self.mouse_dy = 0.0;
@@ -84,7 +97,13 @@ impl Controller {
 
     /// Clears all held input and pending mouse motion.
     pub fn clear(&mut self) {
-        *self = Self::default();
+        let sensitivity = self.mouse_sensitivity;
+        let invert_y = self.invert_y;
+        *self = Self {
+            mouse_sensitivity: sensitivity,
+            invert_y,
+            ..Self::default()
+        };
     }
 }
 

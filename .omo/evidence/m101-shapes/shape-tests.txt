@@ -1,0 +1,11 @@
+
+running 6 tests
+test tests::micro_ao_reads_shape_occupancy ... ok
+test tests::partial_neighbor_subtracts_only_covered_face_area ... ok
+test tests::fence_collision_height_is_one_point_five ... ok
+test tests::shape_mask_counts_match_contract ... ok
+test tests::stair_collision_matches_orientation ... ok
+test tests::shape_template_quads_cover_mask_surface ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

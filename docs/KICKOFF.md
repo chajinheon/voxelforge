@@ -4,6 +4,7 @@
 
 ---
 
+
 당신은 `voxelforge`의 구현 담당이다. 이 저장소는 맥북(Apple M5, macOS 26)용 마인크래프트식 복셀 건축 게임을 Rust + wgpu 30(Metal)로 만든다. 설계는 이미 확정되어 있고, 당신의 일은 그 설계를 순서대로 구현해 오늘 안에 「건축 가능」(M3)까지 도달하는 것이다.
 
 먼저 순서대로 읽어라: `AGENTS.md` → `docs/BLUEPRINT.md` → `docs/ROADMAP.md` → `docs/LOG.md` 맨 위 항목. 읽기 전에 코드를 쓰지 마라.
@@ -341,3 +342,268 @@ M10 `.app`의 asset 경로는 D18을 바꾸지 않고 launcher가 `VF_ASSETS`를
 3. M8 WATER의 HDR read/write feedback 회피, 볼류메트릭 temporal reject, LOD overlap·skirt·메모리 cap이 계약대로인지.
 4. M9가 하드웨어 RT 없이 compute DDA만 사용하고 clipmap toroidal wrap·RGB emission·전체 GI 폴백이 정확한지.
 5. M10 launcher가 D18과 배포 쓰기 경로를 동시에 지키며 셰이더팩·설정·스크린샷·오디오 실패가 게임 종료로 이어지지 않는지.
+# Sol M7→M10 무중단 구현 프롬프트 — M6 리뷰·커밋 완료 후
+
+아래를 GPT-5.6 Sol ultra에 그대로 붙여 넣는다.
+
+---
+
+당신은 `voxelforge`의 구현 담당이다. M6는 구현·자동 검증·Claude 리뷰·커밋까지 완료됐다. 지금부터의 목표는 **M7, M8, M9, M10을 사람 승인 대기 없이 한 번에 연속 구현하고, M10 최종 검증 뒤에만 멈추는 것**이다.
+
+당신은 설계자가 아니다. 설계 선택, 범위 재협상, 사용자 질문, 대안 비교를 하지 않는다. `docs/BLUEPRINT.md §20`과 `docs/ROADMAP.md M7~M10`이 구현 명세다. §16~§19와 충돌하면 §20이 우선한다. 문서에 적힌 숫자·형식·ID·수식·입력·검증을 그대로 실행한다.
+
+## 0. 시작 전에 반드시 읽을 것
+
+순서:
+
+1. `AGENTS.md` 전체.
+2. `docs/LOG.md` 위에서 최소 6개 항목. M6 구현·리뷰·커밋 결과와 현재 HEAD를 확인한다.
+3. `docs/BLUEPRINT.md` §1, §3~§5, §11~§12, §14.11~§14.12, §15 전체.
+4. `docs/BLUEPRINT.md` §16~§20 전체. 최종 우선권은 §20.
+5. `docs/ROADMAP.md` M7~M10 전체.
+6. 현재 코드 중 `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/stream.rs`, `src/render/**`, `src/mesh/**`, `src/world/**`, `src/player/**`, `src/bin/snapshot.rs`, `assets/shaders/**`.
+
+읽기 전에 파일을 수정하지 않는다. 읽은 뒤 첫 LOG 항목에 다음을 기록한다.
+
+```text
+Sol M7→M10 무중단 실행 시작
+base HEAD: <sha>
+M6 tests: <count>
+M6 settled/perf: <LOG 수치>
+설계 우선순위: BLUEPRINT §20
+중간 리뷰 대기: 없음
+최종 정지: M10 이후
+```
+
+## 1. 절대 실행 규칙
+
+1. **M7→M8→M9→M10을 연속으로 간다.** M7, M8, M9 완료 시 LOG와 검증은 남기지만 절대로 멈추거나 리뷰를 요청하지 않는다.
+2. M10의 모든 최종 검증이 끝난 뒤에만 멈춘다. 최종 보고 문구는 정확히 `M7~M10 완료, 최종 리뷰 요청`이다.
+3. 중간에 설계가 크거나 시간이 오래 걸린다는 이유로 범위를 줄이지 않는다. 컨텍스트가 압축되면 LOG와 ROADMAP을 다시 읽고 다음 미완료 단계부터 계속한다.
+4. 사용자에게 질문하지 않는다. 문서의 「묻지 말고 이렇게」 결정을 따른다.
+5. Sol은 `git commit`, `git push`, branch 생성, reset, rebase를 실행하지 않는다. 각 단계 LOG에 의도한 커밋 메시지만 기록한다.
+6. 단계 검증이 실패하면 다음 단계로 넘어가지 않는다. 원인을 수정하고 같은 검증을 다시 실행해 통과시킨 뒤 계속한다.
+7. D1~D18, §12, §14.11~§14.12, §15를 임의 변경하지 않는다. 정말 충돌한다고 판단해도 현재 마일스톤에서는 원안대로 구현하고 LOG의 `ADR 제안`에만 적는다.
+8. `Chunk`는 32³, block storage는 `u16`, `PaddedChunk`는 34³, vertex는 2×u32, `a[23] lowered`, M6 light bits, dynamic-offset chunk uniform, `texture_2d_array`를 유지한다.
+9. `Renderer`는 `Window`, `Surface`, winit event를 소유하거나 import하지 않는다. 창과 `snapshot`이 같은 Renderer를 사용한다.
+10. `main.rs`, `stream.rs`, `renderer.rs`를 포함해 한 모듈 500줄 이하. 400줄에 도달하면 다음 기능을 넣기 전에 하위 모듈로 분리한다.
+11. 우리 코드에 `unsafe` 금지. 렌더 루프의 `unwrap/expect` 금지. 초기화는 `anyhow::Result`, 프레임 오류는 로그 후 기능 폴백 또는 해당 프레임 skip.
+12. wgpu 30 API를 기억으로 쓰지 않는다. §11에 없는 texture array layer view, storage texture feature, timestamp query, query resolve, map/readback, 3D texture copy API는 먼저 `~/.cargo/registry/src/index.crates.io-*/wgpu-30.0.1/src/api/`와 `wgpu-types-30.0.1/src/`에서 확인한다. 확인한 파일·타입을 LOG에 적는다.
+13. 구버전 이름 `ImageCopyTexture`, `SurfaceTexture::present`, `push_constant_ranges`, `Instance::new(&desc)`를 쓰지 않는다.
+14. WGSL은 naga 기준. 임의 include 문법을 만들지 않는다. 공통 WGSL은 Rust가 파일 문자열을 순서대로 결합한다.
+15. shader/pipeline 생성과 hotreload는 error scope로 검증한다. 하나라도 실패하면 새 묶음 전체를 버리고 이전 묶음을 유지한다.
+16. 새 크레이트는 `cargo add`로 실버전을 받아야 한다. M10에서 `font8x8`, `rodio`가 필요하다. 실제 명령과 resolved version을 LOG에 적는다.
+17. 순수 로직은 BLUEPRINT에 적힌 테스트 이름을 그대로 만든다. 테스트 이름을 생략·통합·개명하지 않는다.
+18. 시각 결과를 사람 눈으로 완료 처리하지 않는다. `snapshot` PNG, fixture probe, Python 픽셀 판정을 실제 실행하고 수치를 LOG에 적는다.
+19. 성능 수치를 debug build로 재지 않는다. Apple M5, release, 2560×1440, `m5_air_high`, R=10에서 ROADMAP의 warmup/측정 구간을 쓴다.
+20. GPU timing readback을 렌더 스레드에서 기다리지 않는다. 비동기 ring을 사용하고 미지원 시 게임은 실행하되 명확한 폴백을 기록한다. 대상 Apple M5 최종 검증에서는 timing이 실제로 있어야 한다.
+21. 품질 예산을 넘는다고 render scale, ray 수, shadow 해상도, 아이템 수, 효과 범위를 임의 하향하지 않는다. BLUEPRINT §20.13의 최적화 순서로 병목을 제거한다.
+22. M10 건축 UX는 선택 기능이 아니다. 122개 item, I 인벤토리, 1/16 shape, hand/viewmodel, hotbar, icon이 하나라도 빠지면 완료가 아니다.
+
+## 2. LOG 방식
+
+각 `Mx.y` 시작과 종료에 LOG 맨 위 항목을 추가한다. 종료 항목 형식:
+
+```text
+## <날짜 시각> — Sol — Mx.y 완료
+
+- 만든 것:
+- 변경 모듈과 줄 수:
+- 새 테스트와 전체 테스트 수:
+- 실행한 명령:
+- snapshot 경로와 픽셀/fixture probe 결과:
+- CPU/GPU/메모리 수치:
+- wgpu 30 실제 API 확인:
+- 의도한 커밋 메시지:
+- 다음 단계: Mx.z
+- ADR 제안: 없음 또는 제안 내용
+```
+
+M7, M8, M9 마지막 항목에는 다음 문구만 쓰고 바로 진행한다.
+
+```text
+검증 완료 — 무중단 규칙에 따라 다음 마일스톤 진행
+```
+
+`리뷰 요청`, `사용자 확인 필요`, `잠시 중단`, `다음 세션`을 쓰지 않는다.
+
+## 3. 실행 순서
+
+정확히 다음 순서다.
+
+```text
+M7.0 → M7.1 → M7.2 → M7.3 → M7.4
+→ M8.0 → M8.1 → M8.2 → M8.3 → M8.4 → M8.5
+→ M9.0 → M9.1 → M9.2 → M9.3 → M9.4
+→ M10.0 → M10.1 → M10.2 → M10.3 → M10.4 → M10.5
+```
+
+### M7 핵심
+
+M7은 M5 Air용 렌더 기반을 만든다.
+
+- duplicated Globals/chunk uniform부터 통합한다.
+- 세 개의 16×16 material arrays와 5 mip을 만든다.
+- G-buffer는 albedo, normal/roughness/emission, light/AO/material, motion, reactive, depth다.
+- POM은 full opaque/cutout에만 preset 수치대로 적용한다.
+- 직접광은 GGX PBR다.
+- CSM cascade cadence를 구현한다.
+- SSAO가 아니라 GTAO다.
+- atmosphere LUT 3종과 sky cubemap을 만든다.
+- TAA는 선택이 아니다. native HDR TAAU와 Halton 8 sequence를 구현한다.
+- hand와 UI는 아직 world TAA history에 넣지 않는다.
+- `m5_air_high` 내부 크기는 1848×1040이다.
+
+M7.4 검증이 통과하면 LOG 후 즉시 M8.0.
+
+### M8 핵심
+
+- linear depth pyramid와 deterministic blue-noise부터 만든다.
+- WATER는 GLASS와 분리한다.
+- Gerstner 네 파동, SSR 40+5, 굴절, Beer–Lambert, foam, caustic, underwater를 구현한다.
+- fog와 cloud는 quarter-resolution checkerboard temporal이다.
+- cloud shadow 512², 8-frame cadence.
+- LOD는 2×/4×/8× recursive modal, 32-block overlap, skirt, cache cap이다.
+- M8 효과를 제거해 성능을 맞추지 않는다.
+
+M8.5 검증이 통과하면 LOG 후 즉시 M9.0.
+
+### M9 핵심
+
+- 하드웨어 RT, `wgpu-hal`, Metal acceleration structure를 사용하지 않는다.
+- 4×128³ material/light clipmap.
+- 토로이달 slab update, 4MiB/frame hard cap.
+- WGSL compute DDA, quarter-resolution, 4 rays, 48 blocks, 96 crossings.
+- six emissive materials의 RGB radiance는 §20 표 그대로.
+- temporal 0.90, à-trous 1/2/4.
+- 필수 기능 실패 시 GI 전체를 끄고 M6 light+GTAO로 폴백한다. 반쯤 초기화된 GI를 유지하지 않는다.
+
+M9.4 검증이 통과하면 LOG 후 즉시 M10.0.
+
+### M10 핵심 — 우선순위가 가장 높다
+
+M10은 먼저 건축 시스템을 완성하고, 그 다음 배포 마감을 한다.
+
+#### M10.0 레지스트리
+
+- BlockId 0~88과 상태 range를 한 글자도 임의 변경하지 않는다.
+- ItemId 1~122를 정확히 만든다.
+- ItemId와 BlockId를 같은 것으로 취급하지 않는다.
+- 기존 ID 0~12와 save compatibility를 유지한다.
+- 122개 모두 icon·placement·category·English name이 있어야 한다.
+- texture recipe와 PBR palette를 §20대로 구현한다.
+
+#### M10.1 shape
+
+- non-cube는 16³ occupancy다.
+- 정점 spare bits에 frac_x/y/z를 넣는다.
+- old cube frac은 0.
+- full cube가 partial neighbor와 맞닿을 때 z-fighting이 없도록 face coverage subtraction을 한다.
+- micro AO는 shape occupancy를 읽는다.
+- shape는 axis log, slab, stair, pane, fence만 구현한다. 임의 모델 시스템으로 범위를 넓히지 않는다.
+
+#### M10.2 상호작용
+
+- player collision이 shape AABB를 순회한다.
+- fence collision 1.5 blocks.
+- DDA cell hit 뒤 shape AABB 정확 hit를 한다.
+- slab merge, stair orientation, pane/fence connection state를 계약대로 처리한다.
+- connection state 자동 변경까지 save modified/version에 반영하되 한 사용자 edit당 chunk version 한 번.
+- middle mouse pick block을 구현한다.
+
+#### M10.3 인벤토리
+
+- I 키로 modal inventory.
+- 9×6 grid, 54 visible items.
+- 7 category + All, ASCII search, scroll, tooltip.
+- item click은 selected hotbar slot에 배치.
+- hovered item+number 1..9는 해당 slot에 배치.
+- hotbar와 crosshair는 항상 보인다.
+- 122 icon layer를 시작 시 500ms 안에 bake한다.
+- inventory open 중 world time/physics는 멈추지만 renderer, streaming result apply, save, shader reload는 계속한다.
+- Escape는 inventory를 먼저 닫는다.
+
+#### M10.4 손
+
+- native LDR 오른손과 held item.
+- world TAA history에 포함하지 않는다.
+- FOV 68, transform·duration·priority는 §20 그대로.
+- idle/walk/break/place/switch 전부 구현한다.
+- held item은 cube뿐 아니라 slab/stair/pane/fence shape를 보여준다.
+- settings version 2, hotbar persistence, sound, screenshot도 이 단계에서 구현한다.
+
+#### M10.5 마감
+
+- shaderpack contract 2.
+- material/emission/hand override.
+- pack 실패 시 이전/builtin 유지.
+- `.app`, launcher, Info.plist, icon, ad-hoc codesign.
+- notary credential이 없으면 실행하지 않았다고 LOG에 정확히 적는다. 성공했다고 꾸미지 않는다.
+- 3600-frame creative-build autopilot 최종 측정.
+
+## 4. 오류·폴백 정책
+
+아래는 질문하거나 멈출 이유가 아니다.
+
+- timestamp 미지원: 게임은 실행. 단, Apple M5 최종 장치에서 재확인하고 timing이 없으면 해당 단계 미완료로 수정한다.
+- GI format/pipeline 실패: GI 전체 fallback 후 M10까지 계속. fallback 테스트와 로그 필수.
+- audio device 실패: silent fallback 후 계속.
+- shaderpack 실패: previous/builtin 유지 후 계속.
+- user asset 없음: procedural asset 사용.
+- notary credential 없음: ad-hoc bundle/codesign까지 검증하고 notarize skipped를 기록.
+- save/settings directory 없음: 생성. HOME 없음: 개발 root 또는 memory fallback을 문서 계약대로 사용.
+- screenshot ring full: 네 번째 요청 drop+warning, 렌더 계속.
+
+컴파일 오류를 API 탐색 방식으로 해결하지 않는다. wgpu 관련이면 먼저 실제 registry source를 읽고 한 번에 올바른 API로 고친다.
+
+## 5. 성능 최적화 순서
+
+`m5_air_high` p95가 예산을 넘으면 다음 순서를 지킨다.
+
+1. 매 프레임 생성되는 texture/view/bind-group/pipeline/buffer 제거.
+2. duplicated Globals·chunk uniform·scene copy 제거.
+3. CSM far cascade, atmosphere, cloud shadow cadence가 계약대로 작동하는지 확인.
+4. fullscreen pass fusion: 가능한 경우 tone/grade/sharpen, temporal/composite를 한 pass로 결합.
+5. workgroup 8×8/16×16 비교를 실제 timestamp로 측정.
+6. storage texture 왕복·texture sampling 중복 제거.
+7. draw list Vec 재사용, sort key packed u64, queue.write_buffer batch.
+8. clipmap slab 중복·LOD duplicate generation 제거.
+9. shader divergent branch를 material flags와 `select`로 축소.
+10. CPU profile에서 snapshot copy, mesh upload, UI geometry allocation 제거.
+
+설정 수치 자체를 낮추는 것은 금지다. `cinematic`만 60fps 예산 밖이다.
+
+## 6. 최종 완료 조건
+
+다음이 모두 참이어야 종료한다.
+
+- ROADMAP M7.0~M10.5의 각 완료 조건 통과.
+- 전체 테스트 ≥185.
+- clippy `-D warnings`, fmt check, diff check 통과.
+- 122 item exact.
+- shape gallery probe 전부 통과.
+- I inventory all 및 `Shapes + stair` 픽셀 검증 통과.
+- viewmodel idle/break/place crop 검증 통과.
+- M6 lighting regression 통과.
+- shaderpack broken-pack fallback 통과.
+- `.app` plutil/codesign/launcher smoke 통과.
+- `m5_air_high`, 2560×1440, R=10:
+  - settled <5.0s.
+  - HUD GPU p95 ≤15.40ms.
+  - inventory GPU p95 ≤15.75ms.
+  - full frame p95 ≤16.6ms.
+  - max <25ms.
+  - memory <1.35GiB.
+- LOG에 모든 timing·pixel·memory·version·bundle 결과 기록.
+
+완료 후:
+
+1. `git status --short`를 LOG에 복사한다.
+2. `git diff --stat`를 LOG에 복사한다.
+3. commit은 하지 않는다.
+4. LOG 맨 위에 `M7~M10 완료, 최종 리뷰 요청`을 기록한다.
+5. 진헌에게 정확히 같은 문구와 검증 수치 요약만 보고한다.
+
+시작하라. 첫 작업은 M7.0의 M6 baseline 전체 검증과 현재 renderer resource ownership 지도 작성이다. 그 뒤 M10까지 멈추지 않는다.
+
+---

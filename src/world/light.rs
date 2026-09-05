@@ -129,7 +129,7 @@ impl super::world::World {
                     } as u32,
                 );
                 let block = ch.get(l);
-                let sky = if super::block::def(block).opaque {
+                let sky = if super::block::def(block).light_blocking {
                     beam = 0;
                     0
                 } else {
@@ -251,7 +251,7 @@ pub fn solve_column(input: &LightColumnSnapshot) -> LightColumnResult {
             let mut beam = 15_u8;
             for y in (0..256).rev() {
                 let i = index(x, y, z);
-                if def(input.blocks[i]).opaque {
+                if def(input.blocks[i]).light_blocking {
                     beam = 0;
                 } else if beam > sky_light(light[i]) {
                     light[i] = pack_light(block_light(light[i]), beam);
@@ -266,7 +266,7 @@ pub fn solve_column(input: &LightColumnSnapshot) -> LightColumnResult {
             let fi = face_index(u, y);
             for (face, (x, z)) in [(0, (0, u)), (1, (31, u)), (2, (u, 0)), (3, (u, 31))] {
                 let i = index(x, y, z);
-                if def(input.blocks[i]).opaque {
+                if def(input.blocks[i]).light_blocking {
                     continue;
                 }
                 let incoming = input.incoming[face][fi];
@@ -313,7 +313,7 @@ pub fn solve_column(input: &LightColumnSnapshot) -> LightColumnResult {
             } else {
                 current.saturating_sub(1)
             };
-            !def(input.blocks[ni]).opaque && candidate > sky_light(light[ni])
+            !def(input.blocks[ni]).light_blocking && candidate > sky_light(light[ni])
         }) {
             sky_queue.push_back(i as u32);
         }
@@ -331,7 +331,7 @@ pub fn solve_column(input: &LightColumnSnapshot) -> LightColumnResult {
                 continue;
             }
             let ni = index(nx as usize, ny as usize, nz as usize);
-            if def(input.blocks[ni]).opaque {
+            if def(input.blocks[ni]).light_blocking {
                 continue;
             }
             let candidate = if dy == -1 {
@@ -357,7 +357,7 @@ pub fn solve_column(input: &LightColumnSnapshot) -> LightColumnResult {
                 continue;
             }
             let ni = index(nx as usize, ny as usize, nz as usize);
-            if def(input.blocks[ni]).opaque {
+            if def(input.blocks[ni]).light_blocking {
                 continue;
             }
             let candidate = current.saturating_sub(1);

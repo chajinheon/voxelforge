@@ -1,0 +1,20 @@
+2026-09-05T04:01:23+09:00
+cargo check
+    Checking voxelforge v0.1.0 (/Users/chajinheon/Projects/voxelforge)
+warning: field `size` is never read
+  --> src/render/shadow.rs:30:5
+   |
+26 | pub struct ShadowPipeline {
+   |            -------------- field in this struct
+...
+30 |     size: u32,
+   |     ^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `voxelforge` (lib) generated 1 warning
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.54s
+snapshot
+/tmp/shadow-check.png: PNG image data, 1280 x 720, 8-bit/color RGBA, non-interlaced
+cargo test shadow --lib: 4 passed
+cargo run --release --bin snapshot -- --fixture m7-materials --out /tmp/shadow-check2.png: passed (deferred PCF shader validated at device creation)

@@ -13,6 +13,8 @@ pub struct Globals {
     pub sun_dir: [f32; 4],
     pub time_res: [f32; 4],
     pub sky_color: [f32; 4],
+    pub unjittered_view_proj: [[f32; 4]; 4],
+    pub previous_view_proj: [[f32; 4]; 4],
 }
 
 impl Globals {
@@ -27,6 +29,8 @@ impl Globals {
     ) -> Self {
         Self {
             view_proj: view_proj.to_cols_array_2d(),
+            unjittered_view_proj: view_proj.to_cols_array_2d(),
+            previous_view_proj: view_proj.to_cols_array_2d(),
             cam_pos: [cam_pos.x, cam_pos.y, cam_pos.z, 1.0],
             sun_dir: [day.sun_dir.x, day.sun_dir.y, day.sun_dir.z, day.sun_factor],
             time_res: [time, width, height, 0.0],
@@ -47,8 +51,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn globals_are_exactly_128_bytes() {
-        assert_eq!(std::mem::size_of::<Globals>(), 128);
-        assert_eq!(GLOBALS_SIZE, 128);
+    fn globals_are_exactly_256_bytes() {
+        assert_eq!(std::mem::size_of::<Globals>(), 256);
+        assert_eq!(GLOBALS_SIZE, 256);
     }
 }

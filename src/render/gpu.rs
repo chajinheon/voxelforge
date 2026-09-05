@@ -35,9 +35,11 @@ impl Gpu {
             info.driver,
             info.driver_info
         );
+        let optional_features = adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("voxelforge-device"),
+                required_features: optional_features,
                 ..Default::default()
             })
             .await?;

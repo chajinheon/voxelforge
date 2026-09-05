@@ -1,0 +1,21 @@
+$ cargo test --lib viewmodel
+   Compiling voxelforge v0.1.0 (/Users/chajinheon/Projects/voxelforge)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1.45s
+     Running unittests src/lib.rs (target/debug/deps/voxelforge-c70f7b2cd7df56a4)
+
+running 7 tests
+test ui::viewmodel::tests::viewmodel_action_priority_is_stable ... ok
+test ui::viewmodel::tests::viewmodel_break_duration_is_point_two_six ... ok
+test ui::viewmodel::tests::viewmodel_place_duration_is_point_one_eight ... ok
+test ui::viewmodel::tests::viewmodel_pauses_with_inventory ... ok
+test render::ui::viewmodel::tests::cache_contains_distinct_cube_and_shape_geometry ... ok
+test render::ui::viewmodel::tests::shape_scales_follow_viewmodel_contract ... ok
+test render::ui::viewmodel::tests::draw_uses_projected_shape_faces_instead_of_icon_layers ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 0.02s
+
+$ cargo check --lib
+    Checking voxelforge v0.1.0 (/Users/chajinheon/Projects/voxelforge)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.55s
+
+exit=0

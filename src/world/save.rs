@@ -41,6 +41,21 @@ pub struct SaveDir {
 impl SaveDir {
     /// Open (and create) `saves/<name>/` under the project root.
     pub fn open(name: &str) -> Result<Self> {
+        let root = std::env::var_os("VF_SAVE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let assets_dir = crate::assets::dir();
+                assets_dir.parent().map_or_else(
+                    || PathBuf::from("saves"),
+                    |project_root| project_root.join("saves"),
+                )
+            });
+        Self::open_at(name, &root)
+    }
+
+    /// Open a named save below an explicit root. Used by the bounded benchmark
+    /// so it cannot touch the player's normal world directory.
+    pub fn open_at(name: &str, saves_root: &Path) -> Result<Self> {
         let mut components = Path::new(name).components();
         let valid = !name.is_empty()
             && !name.contains('/')
@@ -50,11 +65,7 @@ impl SaveDir {
         if !valid {
             bail!("save name must be exactly one normal path component");
         }
-        let assets_dir = crate::assets::dir();
-        let project_root = assets_dir
-            .parent()
-            .context("asset directory has no project root")?;
-        let root = project_root.join("saves").join(name);
+        let root = saves_root.join(name);
         fs::create_dir_all(root.join(CHUNKS_DIR))
             .with_context(|| format!("create save directory {}", root.display()))?;
         Ok(Self { root })

@@ -1,10 +1,13 @@
 //! A small, deterministic swept-AABB controller for the player body.
 
 use glam::{IVec3, Vec3};
+use std::sync::OnceLock;
 
 use crate::world::block::{BlockId, WATER, def};
 use crate::world::coords::chunk_of;
 use crate::world::r#gen::{SEA_LEVEL, WorldGen};
+use crate::world::raycast::shape_kind;
+use crate::world::shape::{Aabb, ShapeKind, SmallAabbList, collision_boxes, shape_mask};
 use crate::world::world::World;
 
 use super::camera::{PLAYER_H, PLAYER_HALF_W};
@@ -17,6 +20,41 @@ pub const SPRINT_SPEED: f32 = 5.6;
 pub const FLY_SPEED: f32 = 12.0;
 const COLLISION_EPSILON: f32 = 1.0e-4;
 const SUBSTEP: f32 = 1.0 / 120.0;
+
+const fn full_collision() -> SmallAabbList {
+    let mut collision = SmallAabbList::EMPTY;
+    collision.boxes[0] = Aabb {
+        min: [0, 0, 0],
+        max: [16, 16, 16],
+    };
+    collision.len = 1;
+    collision
+}
+
+const FULL_COLLISION: SmallAabbList = full_collision();
+
+// Shape state IDs are stable and bounded by the block registry. Build their
+// collision boxes once, so a moving player does not rebuild 1/16-block masks on
+// every substep. Cube IDs use the same single box as the original controller.
+static SHAPED_COLLISION: OnceLock<[SmallAabbList; 960]> = OnceLock::new();
+
+fn collision_boxes_for(id: BlockId) -> &'static SmallAabbList {
+    if matches!(shape_kind(id), ShapeKind::Cube) {
+        return &FULL_COLLISION;
+    }
+    let cache = SHAPED_COLLISION.get_or_init(|| {
+        std::array::from_fn(|raw| {
+            let state = raw as BlockId;
+            let kind = shape_kind(state);
+            if matches!(kind, ShapeKind::Cube) {
+                FULL_COLLISION
+            } else {
+                collision_boxes(kind, &shape_mask(kind))
+            }
+        })
+    });
+    cache.get(id as usize).unwrap_or(&FULL_COLLISION)
+}
 
 /// Player position is the centre of the feet (not the eye position).
 #[derive(Clone, Copy, Debug, Default)]
@@ -95,32 +133,48 @@ pub fn sweep_axis(world: &World, min: Vec3, max: Vec3, delta: f32, axis: usize) 
 
                 let other0 = (axis + 1) % 3;
                 let other1 = (axis + 2) % 3;
-                if max[other0] <= bp[other0] as f32 + COLLISION_EPSILON
-                    || min[other0] >= bp[other0] as f32 + 1.0 - COLLISION_EPSILON
-                    || max[other1] <= bp[other1] as f32 + COLLISION_EPSILON
-                    || min[other1] >= bp[other1] as f32 + 1.0 - COLLISION_EPSILON
-                {
-                    continue;
-                }
-
-                let block_min = bp[axis] as f32;
-                let block_max = block_min + 1.0;
-                if delta > 0.0 {
-                    if max[axis] <= block_min + COLLISION_EPSILON && max[axis] + delta >= block_min
+                let collision = collision_boxes_for(id);
+                for shape_box in collision.boxes.iter().take(collision.len as usize) {
+                    let box_min = bp.as_vec3()
+                        + Vec3::new(
+                            shape_box.min[0] as f32,
+                            shape_box.min[1] as f32,
+                            shape_box.min[2] as f32,
+                        ) / 16.0;
+                    let box_max = bp.as_vec3()
+                        + Vec3::new(
+                            shape_box.max[0] as f32,
+                            shape_box.max[1] as f32,
+                            shape_box.max[2] as f32,
+                        ) / 16.0;
+                    if max[other0] <= box_min[other0] + COLLISION_EPSILON
+                        || min[other0] >= box_max[other0] - COLLISION_EPSILON
+                        || max[other1] <= box_min[other1] + COLLISION_EPSILON
+                        || min[other1] >= box_max[other1] - COLLISION_EPSILON
                     {
-                        let allowed = block_min - max[axis];
-                        if allowed < best {
-                            best = allowed.max(0.0);
+                        continue;
+                    }
+
+                    let block_min = box_min[axis];
+                    let block_max = box_max[axis];
+                    if delta > 0.0 {
+                        if max[axis] <= block_min + COLLISION_EPSILON
+                            && max[axis] + delta >= block_min
+                        {
+                            let allowed = block_min - max[axis];
+                            if allowed < best {
+                                best = allowed.max(0.0);
+                                hit = true;
+                            }
+                        }
+                    } else if min[axis] >= block_max - COLLISION_EPSILON
+                        && min[axis] + delta <= block_max
+                    {
+                        let allowed = block_max - min[axis];
+                        if allowed > best {
+                            best = allowed.min(0.0);
                             hit = true;
                         }
-                    }
-                } else if min[axis] >= block_max - COLLISION_EPSILON
-                    && min[axis] + delta <= block_max
-                {
-                    let allowed = block_max - min[axis];
-                    if allowed > best {
-                        best = allowed.min(0.0);
-                        hit = true;
                     }
                 }
             }
@@ -327,5 +381,65 @@ mod tests {
         assert!(body.in_water);
         assert!((body.vel.x - WALK_SPEED * 0.6).abs() < 1e-5);
         assert!((body.vel.y - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn shape_collision_respects_half_slab_height() {
+        let mut world = world_with_floor();
+        world.set_block(IVec3::new(2, 1, 0), crate::world::block::SLAB_BASE);
+
+        // The lower slab occupies y=1.0..1.5. A body starting above it must
+        // pass through its empty upper half while moving horizontally.
+        let min = Vec3::new(0.2, 1.6, 0.2);
+        let max = Vec3::new(0.8, 2.8, 0.8);
+        let (moved, hit) = sweep_axis(&world, min, max, 3.0, 0);
+        assert!(!hit);
+        assert!((moved - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shape_collision_uses_stair_orientation() {
+        let mut world = world_with_floor();
+        world.set_block(IVec3::new(2, 1, 0), crate::world::block::STAIR_BASE);
+        let min = Vec3::new(0.2, 1.6, 0.45);
+        let max = Vec3::new(0.8, 2.8, 1.05);
+        let (north_moved, north_hit) = sweep_axis(&world, min, max, 3.0, 0);
+        assert!(north_hit);
+        assert!((north_moved - 1.2).abs() < 1e-4);
+
+        world.set_block(IVec3::new(2, 1, 0), crate::world::block::STAIR_BASE + 1);
+        let (east_moved, east_hit) = sweep_axis(&world, min, max, 3.0, 0);
+        assert!(east_hit);
+        assert!((east_moved - 1.7).abs() < 1e-4);
+    }
+
+    #[test]
+    fn shape_collision_keeps_fence_height_one_and_a_half() {
+        let mut world = world_with_floor();
+        world.set_block(IVec3::new(2, 1, 0), crate::world::block::FENCE_BASE);
+        let min = Vec3::new(0.2, 2.2, 0.2);
+        let max = Vec3::new(0.8, 3.4, 0.8);
+        let (moved, hit) = sweep_axis(&world, min, max, 3.0, 0);
+        assert!(hit);
+        assert!((moved - 1.575).abs() < 1e-4);
+    }
+
+    #[test]
+    fn shape_collision_uses_pane_connections_and_thickness() {
+        let mut world = world_with_floor();
+        world.set_block(IVec3::new(2, 1, 0), crate::world::block::PANE_BASE);
+
+        let min = Vec3::new(0.2, 1.0, 0.2);
+        let max = Vec3::new(0.8, 2.2, 0.8);
+        let (center_moved, center_hit) = sweep_axis(&world, min, max, 3.0, 0);
+        assert!(center_hit);
+        assert!((center_moved - 1.6375).abs() < 1e-4);
+
+        // A disconnected pane has no arm on the far side of the block.
+        let far_min = Vec3::new(0.2, 1.0, 0.8);
+        let far_max = Vec3::new(0.8, 2.2, 1.4);
+        let (far_moved, far_hit) = sweep_axis(&world, far_min, far_max, 3.0, 0);
+        assert!(!far_hit);
+        assert!((far_moved - 3.0).abs() < 1e-6);
     }
 }

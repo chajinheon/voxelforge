@@ -1,10 +1,9 @@
 //! Surface-free M1 terrain snapshot renderer.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
-use anyhow::Context;
 use glam::{IVec3, Vec3};
-use voxelforge::mesh::{ChunkMeshes, mesh_chunk_all, mesh_chunk_greedy_all};
 use voxelforge::render::{
     DAY_LENGTH_SECONDS, Globals, Gpu, GpuChunkMeshes, OffscreenTarget, RenderView, Renderer,
     day_state,
@@ -15,8 +14,13 @@ use voxelforge::world::coords::{CHUNK_SIZE, WORLD_CHUNKS_Y, chunk_of};
 use voxelforge::world::r#gen::WorldGen;
 use voxelforge::world::world::World;
 
+#[path = "snapshot/args.rs"]
+mod args;
 #[path = "snapshot/fixtures.rs"]
 mod fixtures;
+#[path = "snapshot/ui.rs"]
+mod snapshot_ui;
+use args::parse_args;
 use fixtures::{Fixture, View};
 
 const DEFAULT_SEED: u64 = 1;
@@ -57,17 +61,34 @@ struct Options {
     view: View,
     day_phase: Option<f32>,
     world_time: Option<f32>,
+    preset: voxelforge::render::RenderPreset,
+    render_scale: Option<f32>,
+    fixed_exposure: Option<f32>,
+    warmup: u32,
+    frames: u32,
+    timings: Option<PathBuf>,
+    ui: args::UiMode,
+    inventory_category: args::InventoryCategory,
+    inventory_query: String,
+    hand_action: args::HandActionSpec,
+    held_item: u16,
+    gi: args::GiMode,
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"),
+        env_logger::Env::default().default_filter_or("info,wgpu_core=warn,naga=warn"),
     )
     .init();
 
     let options = parse_args(std::env::args().skip(1))?;
     let gpu = Gpu::new()?;
     let mut renderer = Renderer::new(&gpu.device, &gpu.queue, wgpu::TextureFormat::Rgba8UnormSrgb)?;
+    renderer.configure_gpu_gi(&gpu.adapter, options.width, options.height);
+    renderer.configure_preset(options.preset, options.render_scale);
+    renderer.configure_exposure(options.fixed_exposure);
+    renderer.configure_gpu_timing(options.timings.is_some());
+    renderer.configure_gi(matches!(options.gi, args::GiMode::On));
 
     let generator = WorldGen::new(options.seed);
     let (fixture_position, fixture_yaw, fixture_pitch) = fixtures::camera(options.fixture);
@@ -99,11 +120,18 @@ fn main() -> anyhow::Result<()> {
         &options.edits,
         options.mesher,
         options.fixture,
+        matches!(options.gi, args::GiMode::On),
     )?;
     let world_time = options
         .world_time
         .or_else(|| options.day_phase.map(|phase| phase * DAY_LENGTH_SECONDS))
-        .unwrap_or(0.0);
+        .unwrap_or({
+            if matches!(options.fixture, Fixture::Materials) {
+                900.0
+            } else {
+                0.0
+            }
+        });
     let globals = make_globals(
         position,
         yaw,
@@ -112,16 +140,64 @@ fn main() -> anyhow::Result<()> {
         options.height,
         world_time,
     );
-    renderer.render_view(
-        &target.color_view,
-        &target.depth_view,
-        &globals,
-        &chunks,
-        match options.view {
-            View::Final => RenderView::Final,
-            View::Light => RenderView::Light,
-        },
-    );
+    let snapshot_ui = snapshot_ui::SnapshotUi::new(&options);
+    let render_view = match options.view {
+        View::Final => RenderView::Final,
+        View::Light => RenderView::Light,
+        View::Albedo => RenderView::Albedo,
+        View::Normal => RenderView::Normal,
+        View::Depth => RenderView::Depth,
+        View::Material => RenderView::Material,
+        View::Motion => RenderView::Motion,
+        View::Reactive => RenderView::Reactive,
+        View::Water => RenderView::Water,
+        View::Volumetric => RenderView::Volumetric,
+        View::Cloud => RenderView::Cloud,
+        View::Lod => RenderView::Lod,
+        View::Gi => RenderView::Gi,
+        View::Clipmap => RenderView::Clipmap,
+    };
+    let mut timings = Vec::with_capacity(options.warmup as usize + options.frames as usize);
+    let mut gpu_timings = Vec::with_capacity(options.frames as usize);
+    let total_frames = options.warmup.saturating_add(options.frames).max(1);
+    for frame in 0..total_frames {
+        let started = Instant::now();
+        if let Some(ui) = snapshot_ui.frame(options.width, options.height) {
+            renderer.render_view_with_ui(
+                &target.color_view,
+                &target.depth_view,
+                &globals,
+                &chunks,
+                render_view,
+                &ui,
+            );
+        } else {
+            renderer.render_view(
+                &target.color_view,
+                &target.depth_view,
+                &globals,
+                &chunks,
+                render_view,
+            );
+        }
+        timings.push(started.elapsed().as_secs_f64() * 1000.0);
+        if options.timings.is_some() {
+            gpu.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })?;
+            renderer.poll_gpu_timings();
+        }
+        while let Some(timing) = renderer.take_last_gpu_timings() {
+            // Readback completion lags rendering by an adapter-dependent
+            // number of frames, so retain the rendered frame index instead
+            // of treating this sparse stream as a dense frame array.
+            gpu_timings.push((timing.rendered_frame_index() as usize, timing));
+        }
+        if frame + 1 == total_frames {
+            log::debug!("snapshot: last frame rendered");
+        }
+    }
     let pixels = target.read_pixels(&gpu.device, &gpu.queue)?;
     image::save_buffer_with_format(
         &options.out,
@@ -131,6 +207,18 @@ fn main() -> anyhow::Result<()> {
         image::ColorType::Rgba8,
         image::ImageFormat::Png,
     )?;
+    if options.fixture == Fixture::Shapes && options.view == View::Final {
+        fixtures::write_shape_probes(&pixels, options.width, options.height)?;
+    }
+    if let Some(path) = options.timings {
+        write_timings(
+            &path,
+            options.warmup,
+            &timings,
+            &gpu_timings,
+            renderer.gpu_timing_supported(),
+        )?;
+    }
     log::info!(
         "snapshot: wrote {} ({}x{}, {} chunks)",
         options.out.display(),
@@ -138,6 +226,72 @@ fn main() -> anyhow::Result<()> {
         options.height,
         chunks.len()
     );
+    Ok(())
+}
+
+fn percentile(values: &[f64], numerator: usize, denominator: usize) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted
+        .get((sorted.len().saturating_sub(1) * numerator) / denominator.max(1))
+        .copied()
+        .unwrap_or(0.0)
+}
+
+fn timing_value(values: &[f64]) -> serde_json::Value {
+    if values.is_empty() {
+        return serde_json::json!({
+            "samples": 0,
+            "median_ms": null,
+            "p95_ms": null,
+            "max_ms": null,
+        });
+    }
+    serde_json::json!({
+        "samples": values.len(),
+        "median_ms": percentile(values, 50, 100),
+        "p95_ms": percentile(values, 95, 100),
+        "max_ms": values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    })
+}
+
+fn post_warmup_gpu_frames(
+    warmup: u32,
+    gpu_frames: &[(usize, voxelforge::render::gpu_timing::GpuFrameTimings)],
+) -> Vec<voxelforge::render::gpu_timing::GpuFrameTimings> {
+    gpu_frames
+        .iter()
+        .filter(|(frame, _)| *frame >= warmup as usize)
+        .map(|(_, timing)| *timing)
+        .collect()
+}
+
+fn write_timings(
+    path: &std::path::Path,
+    warmup: u32,
+    cpu_frames: &[f64],
+    gpu_frames: &[(usize, voxelforge::render::gpu_timing::GpuFrameTimings)],
+    gpu_supported: bool,
+) -> anyhow::Result<()> {
+    let start = warmup.min(cpu_frames.len() as u32) as usize;
+    let cpu = &cpu_frames[start..];
+    let gpu = post_warmup_gpu_frames(warmup, gpu_frames);
+    let mut object = serde_json::Map::new();
+    object.insert("frames".into(), serde_json::json!(cpu.len()));
+    object.insert("warmup".into(), serde_json::json!(warmup));
+    object.insert("gpu_supported".into(), serde_json::json!(gpu_supported));
+    object.insert("cpu_frame".into(), timing_value(cpu));
+    for pass in voxelforge::render::gpu_timing::TimedPass::ALL {
+        let values = gpu
+            .iter()
+            .filter_map(|frame| frame.has_sample(pass).then_some(frame.ms(pass)))
+            .collect::<Vec<_>>();
+        object.insert(pass.label().into(), timing_value(&values));
+    }
+    let total = gpu.iter().map(|frame| frame.total_ms()).collect::<Vec<_>>();
+    object.insert("total_gpu".into(), timing_value(&total));
+    let json = serde_json::Value::Object(object);
+    std::fs::write(path, serde_json::to_vec_pretty(&json)?)?;
     Ok(())
 }
 
@@ -149,6 +303,7 @@ fn build_terrain(
     edits: &[Edit],
     mesher: MesherMode,
     fixture: Fixture,
+    populate_gi: bool,
 ) -> anyhow::Result<Vec<GpuChunkMeshes>> {
     let center = chunk_of(IVec3::new(
         position.x.floor() as i32,
@@ -194,9 +349,16 @@ fn build_terrain(
     for cp in dirty {
         let padded = world.padded(cp);
         let meshes = mesher.mesh(&padded);
-        vertex_count += meshes.opaque.vertices.len() + meshes.translucent.vertices.len();
-        index_count += meshes.opaque.indices.len() + meshes.translucent.indices.len();
-        if !(meshes.opaque.vertices.is_empty() && meshes.translucent.vertices.is_empty()) {
+        vertex_count += meshes.opaque.vertices.len()
+            + meshes.translucent.vertices.len()
+            + meshes.water.vertices.len();
+        index_count += meshes.opaque.indices.len()
+            + meshes.translucent.indices.len()
+            + meshes.water.indices.len();
+        if !(meshes.opaque.vertices.is_empty()
+            && meshes.translucent.vertices.is_empty()
+            && meshes.water.vertices.is_empty())
+        {
             gpu_chunks.push(renderer.upload_chunk_meshes(&meshes, cp * 32)?);
         }
     }
@@ -204,6 +366,31 @@ fn build_terrain(
         "snapshot: mesher={} vertices {vertex_count} indices {index_count}",
         mesher.name()
     );
+    if populate_gi {
+        streamer.populate_gi_offline(&world, renderer, position);
+    }
+    let mut local_lights = Vec::new();
+    let extent = (radius.max(1) + 1) * CHUNK_SIZE;
+    for z in position.z.floor() as i32 - extent..=position.z.floor() as i32 + extent {
+        for y in 0..CHUNK_SIZE * WORLD_CHUNKS_Y {
+            for x in position.x.floor() as i32 - extent..=position.x.floor() as i32 + extent {
+                let id = world.get_block(IVec3::new(x, y, z));
+                let emission = voxelforge::world::block::def(id).emission_rgb;
+                if emission.iter().any(|value| *value > 0.0) {
+                    local_lights.push(voxelforge::render::volumetric::FogLight {
+                        position: glam::Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5),
+                        color: glam::Vec3::from_array(emission),
+                        radius: 14.0,
+                    });
+                }
+            }
+        }
+    }
+    let selected = voxelforge::render::volumetric::closest_lights(position, &local_lights);
+    renderer.set_m8_local_lights(&selected);
+    if matches!(fixture, Fixture::Lod) {
+        streamer.populate_lod_rings_offline(&world, renderer, position);
+    }
     Ok(gpu_chunks)
 }
 
@@ -276,222 +463,6 @@ fn forward(yaw: f32, pitch: f32) -> Vec3 {
     )
 }
 
-fn parse_args<I>(args: I) -> anyhow::Result<Options>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut options = Options {
-        seed: DEFAULT_SEED,
-        pos: None,
-        yaw: DEFAULT_YAW,
-        pitch: DEFAULT_PITCH,
-        radius: DEFAULT_RADIUS,
-        width: DEFAULT_WIDTH,
-        height: DEFAULT_HEIGHT,
-        out: PathBuf::from(DEFAULT_OUT),
-        edits: Vec::new(),
-        mesher: MesherMode::Greedy,
-        fixture: Fixture::Terrain,
-        view: View::Final,
-        day_phase: None,
-        world_time: None,
-    };
-    let mut args = args.into_iter();
-    while let Some(flag) = args.next() {
-        let mut value = || {
-            args.next()
-                .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))
-        };
-        match flag.as_str() {
-            "--seed" => options.seed = value()?.parse().context("--seed must be an integer")?,
-            "--pos" => options.pos = Some(parse_vec3(&value()?)?),
-            "--yaw" => options.yaw = value()?.parse().context("--yaw must be a number")?,
-            "--pitch" => options.pitch = value()?.parse().context("--pitch must be a number")?,
-            "--radius" => {
-                options.radius = value()?.parse().context("--radius must be an integer")?;
-                if options.radius < 0 {
-                    anyhow::bail!("--radius must be non-negative");
-                }
-            }
-            "--size" => {
-                let (width, height) = parse_size(&value()?)?;
-                options.width = width;
-                options.height = height;
-            }
-            "--out" => options.out = PathBuf::from(value()?),
-            "--edits" => options.edits = parse_edits(&value()?)?,
-            "--mesher" => {
-                options.mesher = match value()?.as_str() {
-                    "culled" => MesherMode::Culled,
-                    "greedy" => MesherMode::Greedy,
-                    other => anyhow::bail!("--mesher must be culled or greedy, got {other:?}"),
-                };
-            }
-            "--fixture" => options.fixture = Fixture::parse(&value()?)?,
-            "--view" => options.view = View::parse(&value()?)?,
-            "--day-phase" => {
-                let phase: f32 = value()?.parse().context("--day-phase must be a number")?;
-                if !(0.0..=1.0).contains(&phase) {
-                    anyhow::bail!("--day-phase must be between 0 and 1");
-                }
-                options.day_phase = Some(phase);
-            }
-            "--world-time" => {
-                let time: f32 = value()?.parse().context("--world-time must be a number")?;
-                if !time.is_finite() || time < 0.0 {
-                    anyhow::bail!("--world-time must be a non-negative finite number");
-                }
-                options.world_time = Some(time);
-            }
-            "--help" | "-h" => {
-                println!(
-                    "snapshot [--fixture terrain|m6-light-room|m6-wind] [--view final|light] [--day-phase 0..1|--world-time SEC] [--seed N] [--pos X,Y,Z] [--yaw R] [--pitch R] [--radius N] [--size WxH] [--out PATH] [--edits \"set X,Y,Z,ID; ...\"] [--mesher culled|greedy]"
-                );
-                std::process::exit(0);
-            }
-            _ => anyhow::bail!("unknown argument: {flag}"),
-        }
-    }
-    if options.day_phase.is_some() && options.world_time.is_some() {
-        anyhow::bail!("--day-phase and --world-time are mutually exclusive");
-    }
-    Ok(options)
-}
-
-impl MesherMode {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Culled => "culled",
-            Self::Greedy => "greedy",
-        }
-    }
-
-    fn mesh(self, padded: &voxelforge::world::chunk::PaddedChunk) -> ChunkMeshes {
-        match self {
-            Self::Culled => mesh_chunk_all(padded),
-            Self::Greedy => mesh_chunk_greedy_all(padded),
-        }
-    }
-}
-
-fn parse_edits(value: &str) -> anyhow::Result<Vec<Edit>> {
-    let mut edits = Vec::new();
-    for command in value.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        let fields = command
-            .strip_prefix("set ")
-            .ok_or_else(|| anyhow::anyhow!("edit must use `set X,Y,Z,ID`: {command:?}"))?
-            .split(',')
-            .collect::<Vec<_>>();
-        if fields.len() != 4 {
-            anyhow::bail!("edit must use `set X,Y,Z,ID`: {command:?}");
-        }
-        let parse_coord = |field: &str| {
-            field
-                .parse::<i32>()
-                .with_context(|| format!("edit coordinate must be an integer: {field:?}"))
-        };
-        let position = IVec3::new(
-            parse_coord(fields[0])?,
-            parse_coord(fields[1])?,
-            parse_coord(fields[2])?,
-        );
-        let id = fields[3]
-            .parse::<BlockId>()
-            .with_context(|| format!("edit block id must be an integer: {:?}", fields[3]))?;
-        if id > TORCH {
-            anyhow::bail!("edit block id must be between {AIR} and {TORCH}: {id}");
-        }
-        edits.push(Edit { position, id });
-    }
-    if edits.is_empty() {
-        anyhow::bail!("--edits requires at least one `set X,Y,Z,ID` command");
-    }
-    Ok(edits)
-}
-
-fn parse_vec3(value: &str) -> anyhow::Result<Vec3> {
-    let values: Vec<f32> = value
-        .split(',')
-        .map(|part| part.parse().context("--pos components must be numbers"))
-        .collect::<anyhow::Result<_>>()?;
-    match values.as_slice() {
-        [x, y, z] => Ok(Vec3::new(*x, *y, *z)),
-        _ => anyhow::bail!("--pos must be X,Y,Z"),
-    }
-}
-
-fn parse_size(value: &str) -> anyhow::Result<(u32, u32)> {
-    let (width, height) = value
-        .split_once('x')
-        .ok_or_else(|| anyhow::anyhow!("--size must be WIDTHxHEIGHT"))?;
-    let width: u32 = width.parse().context("--size width must be an integer")?;
-    let height: u32 = height.parse().context("--size height must be an integer")?;
-    if width == 0 || height == 0 {
-        anyhow::bail!("--size dimensions must be non-zero");
-    }
-    Ok((width, height))
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use voxelforge::world::block::STONE;
-
-    #[test]
-    fn snapshot_noop_edit_is_warning() {
-        let mut world = World::new(DEFAULT_SEED);
-        let position = IVec3::new(0, 0, 0);
-        world.ensure_loaded(chunk_of(position));
-        let existing = world.get_block(position);
-        assert_eq!(existing, STONE);
-
-        let outcome = apply_edit(
-            &mut world,
-            Edit {
-                position,
-                id: existing,
-            },
-        )
-        .expect("same-ID edit should be accepted as a warning");
-        let EditOutcome::Noop(warning) = outcome else {
-            panic!("same-ID edit should return its warning outcome");
-        };
-        assert!(warning.contains("IVec3(0, 0, 0)"));
-        assert!(warning.contains("existing id 1"));
-    }
-
-    #[test]
-    fn snapshot_fixture_and_view_flags_parse() {
-        let options = parse_args([
-            "--fixture".into(),
-            "m6-light-room".into(),
-            "--view".into(),
-            "light".into(),
-            "--day-phase".into(),
-            "0.25".into(),
-            "--edits".into(),
-            "set 0,0,0,12".into(),
-        ])
-        .expect("fixture flags should parse");
-        assert_eq!(options.fixture, Fixture::LightRoom);
-        assert_eq!(options.view, View::Light);
-        assert_eq!(options.day_phase, Some(0.25));
-        assert_eq!(options.world_time, None);
-        assert_eq!(options.edits[0].id, TORCH);
-    }
-
-    #[test]
-    fn snapshot_rejects_two_time_controls() {
-        let result = parse_args([
-            "--day-phase".into(),
-            "0.25".into(),
-            "--world-time".into(),
-            "10".into(),
-        ]);
-        let error = match result {
-            Ok(_) => panic!("day phase and world time must be exclusive"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("mutually exclusive"));
-    }
-}
+#[path = "snapshot/tests.rs"]
+mod tests;

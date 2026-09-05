@@ -1,0 +1,16 @@
+M10 inventory pixel gate evidence (2026-09-05 KST)
+
+Commands:
+  cargo run --release --bin snapshot -- --fixture m10-inventory --size 1280x720 --ui inventory --inventory-category all --inventory-query "" --out /tmp/vf_m10_inventory.png
+  cargo run --release --bin snapshot -- --fixture m10-inventory --size 1280x720 --ui inventory --inventory-category shapes --inventory-query stair --out /tmp/vf_m10_inventory_stair.png
+
+PIL contract:
+  all image size: (1280, 720)
+  panel alpha (174,66): 255
+  panel alpha (640,360): 255
+  all-grid crop unique RGB: 7859 (required >= 512)
+  Shapes + stair occupied cells by variance: 12 (required == 12)
+
+Artifacts:
+  /tmp/vf_m10_inventory.png
+  /tmp/vf_m10_inventory_stair.png

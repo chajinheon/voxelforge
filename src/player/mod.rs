@@ -4,6 +4,8 @@ pub mod camera;
 pub mod controller;
 pub mod interaction;
 pub mod physics;
+pub mod pick;
+pub mod place;
 
 pub use camera::Camera;
 pub use controller::Controller;
